@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Pixel Pac-Man</title>
+<style>
+  :root { color-scheme: dark; --bg:#0b0b14; --fg:#f2f2f7; --dim:#8a8aa0; --pad:#1d1d33; --accent:#ffd60a; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body { margin:0; min-height:100svh; background:var(--bg); color:var(--fg); font:16px/1.4 system-ui,sans-serif;
+         display:flex; flex-direction:column; align-items:center; justify-content:space-between; padding:16px;
+         touch-action:none; user-select:none; }
+  h1 { margin:8px 0 0; font-size:20px; letter-spacing:.04em; }
+  #stats { color:var(--dim); font-variant-numeric:tabular-nums; min-height:1.4em; }
+  #pad { display:grid; grid-template:repeat(3,min(26vw,110px))/repeat(3,min(26vw,110px)); gap:10px; }
+  .k { border:0; border-radius:20px; background:var(--pad); color:var(--fg); font-size:34px; }
+  .k:active, .k.on { background:#34345c; }
+  #start { grid-area:2/2; background:var(--accent); color:#000; font-size:17px; font-weight:700; }
+  #up { grid-area:1/2 } #left { grid-area:2/1 } #right { grid-area:2/3 } #down { grid-area:3/2 }
+  p { color:var(--dim); font-size:13px; text-align:center; margin:0 0 8px; }
+</style></head>
+<body>
+<h1>PIXEL PAC-MAN</h1>
+<div id="stats">Press Start</div>
+<div id="pad">
+  <button class="k" id="up" data-d="up">▲</button>
+  <button class="k" id="left" data-d="left">◀</button>
+  <button class="k" id="start">START</button>
+  <button class="k" id="right" data-d="right">▶</button>
+  <button class="k" id="down" data-d="down">▼</button>
+</div>
+<p>Swipe anywhere, or use the arrow keys / WASD. Turns are buffered: press early.</p>
+<script>
+const send = (path) => fetch(path, {method: "POST"}).catch(() => {});
+const dir = (d) => send("/api/input?d=" + d);
+document.querySelectorAll("[data-d]").forEach(b =>
+  b.addEventListener("pointerdown", e => { e.preventDefault(); dir(b.dataset.d); }));
+document.getElementById("start").addEventListener("pointerdown", e => { e.preventDefault(); send("/api/start"); });
+const keys = {ArrowUp:"up", w:"up", ArrowDown:"down", s:"down", ArrowLeft:"left", a:"left", ArrowRight:"right", d:"right"};
+addEventListener("keydown", e => {
+  if (keys[e.key]) { e.preventDefault(); dir(keys[e.key]); }
+  else if (e.key === "Enter" || e.key === " ") { e.preventDefault(); send("/api/start"); }
+});
+let sx = 0, sy = 0;
+addEventListener("touchstart", e => { sx = e.touches[0].clientX; sy = e.touches[0].clientY; }, {passive:true});
+addEventListener("touchend", e => {
+  const dx = e.changedTouches[0].clientX - sx, dy = e.changedTouches[0].clientY - sy;
+  if (Math.max(Math.abs(dx), Math.abs(dy)) < 30 || e.target.closest("button")) return;
+  dir(Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? "right" : "left") : (dy > 0 ? "down" : "up"));
+}, {passive:true});
+const stats = document.getElementById("stats");
+setInterval(async () => {
+  try {
+    const s = await (await fetch("/api/state")).json();
+    stats.textContent = s.running ? `Score ${s.score} · Lives ${s.lives} · Level ${s.level}`
+                                  : (s.score ? `Last game: ${s.score} · Press Start` : "Press Start");
+  } catch { stats.textContent = "Can't reach the light"; }
+}, 700);
+</script>
+</body></html>
