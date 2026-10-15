@@ -14,6 +14,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"pixeld/cards"
 	api "pixeld/esphomeapi"
 )
 
@@ -61,6 +62,7 @@ type Satellite struct {
 	Name, FriendlyName, MAC, Version string
 	ConfigPath                       string
 	OnPhase                          func(Phase) // panel / LED feedback
+	OnTimers                         func()      // the running timers changed (redraw the overlay)
 
 	models   map[string]WakeModel
 	detector *Detector
@@ -76,11 +78,20 @@ type Satellite struct {
 	ttsPlayed    bool
 	continueConv bool
 	ringing      bool
+	ringName     string // the timer that's ringing
 	mpState      api.MediaPlayerState
+
+	// shown on the panel
+	heard, reply    string // what was understood / is being said back (or announced)
+	notice          notice
+	timers          map[string]*voiceTimer
+	timerFocus      string // the timer just set or changed: full screen until timerFocusUntil
+	timerFocusUntil time.Time
 }
 
 func NewSatellite(modelDir, mwwBin string) *Satellite {
-	s := &Satellite{models: LoadModels(modelDir), cfg: Config{Volume: 0.8}, mpState: api.MediaPlayerState_MEDIA_PLAYER_STATE_IDLE}
+	s := &Satellite{models: LoadModels(modelDir), cfg: Config{Volume: 0.8}, mpState: api.MediaPlayerState_MEDIA_PLAYER_STATE_IDLE,
+		timers: map[string]*voiceTimer{}}
 	s.detector = NewDetector(mwwBin, s.models, s.onWake)
 	return s
 }
@@ -158,6 +169,7 @@ func (s *Satellite) ToggleMic() bool {
 	muted := s.cfg.MicMuted
 	s.streaming = false
 	s.saveConfig()
+	s.notice = notice{kind: noticeMic, on: !muted, at: time.Now()}
 	s.mu.Unlock()
 	log.Printf("voice: microphone %s", map[bool]string{true: "muted", false: "on"}[muted])
 	if muted {
@@ -195,6 +207,7 @@ func (s *Satellite) start(phrase string, chime bool) {
 		return
 	}
 	s.pipeline, s.ttsURL, s.ttsPlayed, s.continueConv = true, "", false, false
+	s.heard, s.reply = "", ""
 	conn := s.conn
 	s.mu.Unlock()
 	s.setPhase(Listening)
@@ -284,6 +297,9 @@ func (s *Satellite) event(ev *api.VoiceAssistantEventResponse) {
 		s.mu.Unlock()
 		if t := data["text"]; t != "" {
 			log.Printf("voice: heard %q", t)
+			s.mu.Lock()
+			s.heard = cards.Printable(t)
+			s.mu.Unlock()
 		}
 		s.setPhase(Thinking)
 	case api.VoiceAssistantEvent_VOICE_ASSISTANT_INTENT_PROGRESS:
@@ -291,9 +307,18 @@ func (s *Satellite) event(ev *api.VoiceAssistantEventResponse) {
 			s.playTTS()
 		}
 	case api.VoiceAssistantEvent_VOICE_ASSISTANT_INTENT_END:
+		s.mu.Lock()
 		if data["continue_conversation"] == "1" {
-			s.mu.Lock()
 			s.continueConv = true
+		}
+		if t := data["speech"]; t != "" { // the reply (also in TTS_START's text; order varies when streaming)
+			s.reply = cards.Printable(t)
+		}
+		s.mu.Unlock()
+	case api.VoiceAssistantEvent_VOICE_ASSISTANT_TTS_START:
+		if t := data["text"]; t != "" {
+			s.mu.Lock()
+			s.reply = cards.Printable(t)
 			s.mu.Unlock()
 		}
 	case api.VoiceAssistantEvent_VOICE_ASSISTANT_TTS_END:
@@ -322,11 +347,12 @@ func (s *Satellite) event(ev *api.VoiceAssistantEventResponse) {
 }
 
 func (s *Satellite) timer(ev *api.VoiceAssistantTimerEventResponse) {
+	s.timerEvent(ev, time.Now())
 	switch ev.EventType {
 	case api.VoiceAssistantTimerEvent_VOICE_ASSISTANT_TIMER_FINISHED:
 		log.Printf("voice: timer %q finished", ev.Name)
 		s.mu.Lock()
-		s.ringing = true
+		s.ringing, s.ringName = true, cards.Printable(ev.Name)
 		s.mu.Unlock()
 		s.setPhase(TimerRinging)
 		deadline := time.Now().Add(timerRingMax)
@@ -443,6 +469,9 @@ func (s *Satellite) Message(c *api.Conn, m proto.Message) {
 	case *api.VoiceAssistantEventResponse:
 		s.event(req)
 	case *api.VoiceAssistantAnnounceRequest:
+		s.mu.Lock()
+		s.reply = cards.Printable(req.Text)
+		s.mu.Unlock()
 		s.announce(req.PreannounceMediaId, req.MediaId, req.StartConversation)
 	case *api.VoiceAssistantTimerEventResponse:
 		s.timer(req)
@@ -476,6 +505,7 @@ func (s *Satellite) mediaCommand(req *api.MediaPlayerCommandRequest) {
 		s.mu.Lock()
 		s.cfg.Volume = float64(req.Volume)
 		s.saveConfig()
+		s.notice = notice{kind: noticeVolume, level: s.cfg.Volume, on: !s.cfg.SpeakerMuted, at: time.Now()}
 		s.mu.Unlock()
 		s.speaker.SetVolume(float64(req.Volume))
 		s.setMediaState(s.mediaState().State)
@@ -501,6 +531,7 @@ func (s *Satellite) mediaCommand(req *api.MediaPlayerCommandRequest) {
 			s.mu.Lock()
 			s.cfg.SpeakerMuted = req.Command == api.MediaPlayerCommand_MEDIA_PLAYER_COMMAND_MUTE
 			s.saveConfig()
+			s.notice = notice{kind: noticeVolume, level: s.cfg.Volume, on: !s.cfg.SpeakerMuted, at: time.Now()}
 			s.mu.Unlock()
 			s.speaker.SetMuted(s.cfg.SpeakerMuted)
 			s.setMediaState(s.mediaState().State)

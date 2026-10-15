@@ -38,11 +38,11 @@ func main() {
 		img.Pix[i] = 30
 	}
 	for n, spec := range specs {
-		render, err := cards.New(json.RawMessage(spec))
+		card, err := cards.New(json.RawMessage(spec), cards.Env{})
 		if err != nil {
 			log.Fatalf("%s: %v", spec, err)
 		}
-		f, _ := render(now)
+		f, _ := card.Render(now)
 		ox, oy := 20+n*cell, 20
 		for y := 0; y < panel.Size; y++ {
 			for x := 0; x < panel.Size; x++ {

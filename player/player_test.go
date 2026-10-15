@@ -118,3 +118,38 @@ func TestStreamOverridesThenTimesOut(t *testing.T) {
 		t.Fatalf("stream while off: %+v", p.Status())
 	}
 }
+
+func TestOverlay(t *testing.T) {
+	p, r, now := setup()
+	p.SetPlaylist([]*Item{still("a", 1, 30*time.Second)})
+	on := true
+	p.SetOverlay(func(f *panel.Frame, at time.Time, quiet bool) (bool, time.Time) {
+		if !on || quiet {
+			return false, time.Time{}
+		}
+		f[0][0] = [3]uint8{255, 0, 0}
+		return true, at.Add(time.Second)
+	})
+	next, _ := p.step()
+	if got := r.shown[len(r.shown)-1]; got[0][0] != [3]uint8{255, 0, 0} || got[1][1] != [3]uint8{1, 1, 1} {
+		t.Fatalf("overlay not composited: %v %v", got[0][0], got[1][1])
+	}
+	if !next.Equal(now.Add(time.Second)) {
+		t.Fatalf("next %v", next)
+	}
+	if p.items[0].Frames[0].Pixels[0][0] != [3]uint8{1, 1, 1} {
+		t.Fatal("overlay drew into the item's own frame")
+	}
+	on = false
+	n := len(r.shown)
+	p.step()
+	if len(r.shown) != n+1 || r.shown[n][0][0] != [3]uint8{1, 1, 1} {
+		t.Fatal("overlay removed: playlist frame not redrawn")
+	}
+	on = true
+	p.SetPlaylist([]*Item{{Name: "clock", Key: "clock", ShowsBadges: true, Frames: still("x", 2, 0).Frames}})
+	p.step()
+	if r.shown[len(r.shown)-1][0][0] != [3]uint8{2, 2, 2} {
+		t.Fatal("overlay drawn over an item that shows badges itself")
+	}
+}

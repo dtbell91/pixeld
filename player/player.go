@@ -27,7 +27,16 @@ type Item struct {
 	// Render, if set, draws the item live (e.g. a clock) instead of Frames: the frame for now and when it
 	// next changes (zero: not until something else changes).
 	Render func(now time.Time) (*panel.Frame, time.Time)
+	// ShowsBadges: the item makes room for what the overlay shows (e.g. a clock showing a running timer).
+	ShowsBadges bool
 }
+
+// Overlay draws on top of whatever is showing (playlist, image or stream), e.g. a running timer. It gets a
+// copy of the frame to draw into and reports whether it drew anything and when it next changes (zero: not
+// until something else changes). quiet: the item showing makes room for it already (Item.ShowsBadges), so
+// only something urgent should be drawn. It runs with the player locked, so it must not call back into the
+// player.
+type Overlay func(f *panel.Frame, now time.Time, quiet bool) (drawn bool, next time.Time)
 
 const (
 	ShowingOff      = "off"
@@ -62,6 +71,7 @@ type Player struct {
 	intrUntil  time.Time // zero: until Resume
 	live       *panel.Frame // latest streamed frame (DDP), shown over everything until liveUntil
 	liveUntil  time.Time
+	overlay    Overlay
 	wake       chan struct{}
 	onStatus   func(Status)
 	last       Status
@@ -158,6 +168,25 @@ func (p *Player) Stream(f *panel.Frame) {
 	p.mu.Unlock()
 	p.poke()
 }
+
+// EndStream drops the streamed frame now rather than StreamTimeout after the last one.
+func (p *Player) EndStream() {
+	p.mu.Lock()
+	p.live = nil
+	p.mu.Unlock()
+	p.poke()
+}
+
+// SetOverlay sets (nil: removes) the layer drawn over everything shown while the panel is on.
+func (p *Player) SetOverlay(o Overlay) {
+	p.mu.Lock()
+	p.overlay = o
+	p.mu.Unlock()
+	p.poke()
+}
+
+// Refresh redraws now, e.g. because what the overlay draws has changed.
+func (p *Player) Refresh() { p.poke() }
 
 // Next skips to the next playlist item (or resumes the playlist if interrupted).
 func (p *Player) Next() {
@@ -260,6 +289,7 @@ func (p *Player) step() (time.Time, error) {
 		p.live = nil
 	}
 	var frame *panel.Frame
+	quiet := false
 	switch {
 	case !p.on:
 		frame = &p.blank
@@ -273,11 +303,20 @@ func (p *Player) step() (time.Time, error) {
 		var end time.Time
 		frame, end = frameAt(p.items[p.idx], p.itemStart, now)
 		next = earliest(next, end)
+		quiet = p.items[p.idx].ShowsBadges
 	default:
 		frame = &p.blank
 	}
 	if frame == nil {
 		frame = &p.blank
+	}
+	if p.on && p.overlay != nil {
+		c := *frame
+		drawn, end := p.overlay(&c, now, quiet)
+		if drawn {
+			frame = &c // a new frame each time, so it is always redrawn
+		}
+		next = earliest(next, end)
 	}
 	bri := p.brightness
 	st := p.status()

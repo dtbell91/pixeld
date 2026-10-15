@@ -2,6 +2,7 @@
 package cards
 
 import (
+	"strings"
 	"unicode"
 
 	"pixeld/panel"
@@ -54,3 +55,35 @@ func TextWidth(s string, scale int) int {
 func dim(c RGB, f float64) RGB {
 	return RGB{uint8(float64(c[0]) * f), uint8(float64(c[1]) * f), uint8(float64(c[2]) * f)}
 }
+
+// Printable reduces s to what the 3x5 font can draw: capitals, with unknown characters dropped and runs
+// of spaces collapsed.
+func Printable(s string) string {
+	var b strings.Builder
+	space := true
+	for _, r := range strings.ToUpper(s) {
+		if unicode.IsSpace(r) {
+			r = ' '
+		} else if _, ok := font3x5[r]; !ok {
+			continue
+		}
+		if r == ' ' && space {
+			continue
+		}
+		space = r == ' '
+		b.WriteRune(r)
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// Fill paints the rectangle w×h at (x, y).
+func Fill(f *panel.Frame, x, y, w, h int, c RGB) {
+	for j := y; j < y+h; j++ {
+		for i := x; i < x+w; i++ {
+			set(f, i, j, c)
+		}
+	}
+}
+
+// Dim scales a colour's brightness by f (0..1).
+func Dim(c RGB, f float64) RGB { return dim(c, f) }

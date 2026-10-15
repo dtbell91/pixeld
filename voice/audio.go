@@ -151,7 +151,13 @@ func (s *Speaker) PlayPCM(pcm []byte, rate, channels int, done func()) {
 			binary.LittleEndian.PutUint16(scaled[i:], uint16(int16(math.Max(-32768, math.Min(32767, v*gain)))))
 		}
 		amp(true)
-		defer func() { time.AfterFunc(300*time.Millisecond, func() { if !s.Playing() { amp(false) } }) }()
+		defer func() {
+			time.AfterFunc(300*time.Millisecond, func() {
+				if !s.Playing() {
+					amp(false)
+				}
+			})
+		}()
 		cmd := exec.CommandContext(ctx, "aplay", "-q", "-D", "plughw:0,0", "-t", "raw", "-f", "S16_LE",
 			"-r", fmt.Sprint(rate), "-c", fmt.Sprint(channels))
 		cmd.Stdin = bytes.NewReader(scaled)

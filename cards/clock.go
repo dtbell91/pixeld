@@ -22,6 +22,7 @@ type Clock struct {
 	spec  ClockSpec
 	loc   *time.Location
 	color RGB
+	badge func(time.Time) (Badge, bool) // shown in place of the date
 }
 
 func NewClock(spec ClockSpec) (*Clock, error) {
@@ -82,8 +83,17 @@ func (c *Clock) Render(now time.Time) (*panel.Frame, time.Time) {
 	default:
 		date = fmt.Sprintf("%s %d", strings.ToUpper(t.Weekday().String()[:3]), t.Day())
 	}
+	dateColor := dim(c.color, 0.55)
+	if c.badge != nil {
+		if b, ok := c.badge(now); ok {
+			date, dateColor = b.Text, b.Color
+			if b.Paused && t.Second()%2 == 1 {
+				date = ""
+			}
+		}
+	}
 	if date != "" {
-		Text(&f, date, (panel.Size-TextWidth(date, 1))/2, 21, 1, dim(c.color, 0.55))
+		Text(&f, date, (panel.Size-TextWidth(date, 1))/2, 21, 1, dateColor)
 	}
 	if c.spec.Seconds {
 		n := t.Second() * panel.Size / 60
@@ -93,3 +103,6 @@ func (c *Clock) Render(now time.Time) (*panel.Frame, time.Time) {
 	}
 	return &f, t.Truncate(time.Second).Add(time.Second)
 }
+
+// SetBadge shows badge (e.g. a running timer) in place of the date.
+func (c *Clock) SetBadge(badge func(time.Time) (Badge, bool)) { c.badge = badge }

@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
@@ -69,6 +70,19 @@ type app struct {
 	missing   map[string]bool
 	lastState []byte
 	voice     *voice.Satellite
+	sat       atomic.Pointer[voice.Satellite] // = voice, for cards drawing on the player's goroutine
+}
+
+const timerSlot = 10 * time.Second // the timers' own turn in the rotation while any are running
+
+// cardEnv is what playlist cards can show besides their spec: the soonest running timer.
+func (a *app) cardEnv() cards.Env {
+	return cards.Env{Badge: func(now time.Time) (cards.Badge, bool) {
+		if s := a.sat.Load(); s != nil {
+			return s.TimerBadge(now)
+		}
+		return cards.Badge{}, false
+	}}
 }
 
 func (a *app) topic(s string) string { return a.cfg.prefix + s }
@@ -109,12 +123,13 @@ func (a *app) applyPlaylist() {
 	for _, it := range a.playlist.Items {
 		dur := time.Duration(it.Duration * float64(time.Second))
 		if len(it.Card) > 0 {
-			render, err := cards.New(it.Card)
+			card, err := cards.New(it.Card, a.cardEnv())
 			if err != nil {
 				log.Printf("playlist item %q: %v", it.Name, err)
 				continue
 			}
-			items = append(items, &player.Item{Name: it.Name, Key: "card:" + it.Name, Duration: dur, Render: render})
+			items = append(items, &player.Item{Name: it.Name, Key: "card:" + it.Name, Duration: dur,
+				Render: card.Render, ShowsBadges: card.ShowsBadges})
 			continue
 		}
 		if !reKey.MatchString(it.Key) {
@@ -127,6 +142,10 @@ func (a *app) applyPlaylist() {
 			continue
 		}
 		items = append(items, &player.Item{Name: it.Name, Key: it.Key, Frames: f, Duration: dur})
+	}
+	if a.voice != nil && a.voice.HasTimers() {
+		items = append(items, &player.Item{Name: "timers", Key: "voice:timers", Duration: timerSlot,
+			Render: a.voice.RenderTimers, ShowsBadges: true})
 	}
 	// forget decoded content no longer referenced (the files stay cached on disk)
 	for k := range a.frames {
@@ -279,11 +298,12 @@ func (a *app) onSet(_ mqtt.Client, m mqtt.Message) {
 
 // idleLED: green = display on, red = off, amber = microphone muted (voice satellite).
 func (a *app) idleLED(st player.Status) {
-	if a.voice != nil && a.voice.Phase() != voice.Idle {
+	sat := a.sat.Load()
+	if sat != nil && sat.Phase() != voice.Idle {
 		return
 	}
 	switch {
-	case a.voice != nil && a.voice.MicMuted():
+	case sat != nil && sat.MicMuted():
 		hw.SetLED(100, 40, 0)
 	case st.On:
 		hw.SetLED(0, 100, 0)
@@ -325,10 +345,21 @@ func (a *app) startVoice(ctx context.Context, addr string) *voice.Satellite {
 		default:
 			a.idleLED(a.player.Status())
 		}
+		a.player.Refresh() // the timer overlay steps aside while the satellite has the panel
 	}
+	sat.OnTimers = func() {
+		a.mu.Lock()
+		a.applyPlaylist() // timers get a turn in the rotation while any are running
+		a.mu.Unlock()
+		a.player.Refresh()
+	}
+	a.mu.Lock()
 	a.voice = sat
+	a.mu.Unlock()
+	a.sat.Store(sat)
+	a.player.SetOverlay(sat.DrawTimers)
 	go sat.Run(ctx)
-	go voice.Show(ctx, sat.Phase, a.player.Stream)
+	go voice.Show(ctx, sat, a.player.Stream, a.player.EndStream)
 	go func() {
 		if err := (&esphomeapi.Server{Name: sat.Name, Handler: sat}).ListenAndServe(addr); err != nil {
 			log.Printf("voice: %v", err)
