@@ -39,8 +39,10 @@ func setupMixer() {
 func Capture(ctx context.Context, fn func(pcm []byte)) {
 	for ctx.Err() == nil {
 		setupMixer()
+		// 10 ms periods: arecord's default (a quarter of up to 0.5 s) delivered speech, and its end, in
+		// ~125 ms bursts
 		cmd := exec.CommandContext(ctx, "arecord", "-q", "-D", "hw:0,0", "-c", fmt.Sprint(captureCh), "-r",
-			fmt.Sprint(SampleRate), "-f", "S16_LE", "-t", "raw")
+			fmt.Sprint(SampleRate), "-f", "S16_LE", "-t", "raw", "--period-time=10000", "--buffer-time=200000")
 		out, err := cmd.StdoutPipe()
 		if err == nil {
 			err = cmd.Start()

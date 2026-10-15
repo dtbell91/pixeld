@@ -36,6 +36,8 @@ const (
 	mpVolumeStep  = 1 << 10
 	mediaKey      = 1
 	maxActiveWake = 2
+	maxHeld       = 300             // 3 s of microphone audio kept while the stream to Home Assistant opens
+	startWait     = 2 * time.Second // stream anyway if Home Assistant doesn't answer a run request
 	timerRingMax  = 30 * time.Second
 )
 
@@ -84,6 +86,9 @@ type Satellite struct {
 	announcing   int                  // announcements playing (shown as the media player's state meanwhile)
 	queue        []string             // music URLs enqueued after the current one
 	musicGen     int                  // which playMusic is current
+	run          int                  // counts pipeline runs (a late fallback can't start the next one)
+	holding      bool                 // woken: keep microphone audio until the stream to HA opens
+	held         [][]byte             // ... that audio (10 ms frames)
 
 	// shown on the panel
 	heard, reply    string // what was understood / is being said back (or announced)
@@ -132,11 +137,27 @@ func (s *Satellite) Run(ctx context.Context) {
 func (s *Satellite) onAudio(pcm []byte) {
 	s.mu.Lock()
 	muted, streaming, conn := s.cfg.MicMuted, s.streaming, s.conn
+	var held [][]byte
+	if s.holding && !streaming {
+		// woken but not streaming yet (chime, request): keep what's said for when the stream opens
+		if len(s.held) < maxHeld {
+			s.held = append(s.held, pcm)
+		}
+		s.mu.Unlock()
+		return
+	}
+	if streaming {
+		held, s.held, s.holding = s.held, nil, false
+	}
 	s.mu.Unlock()
 	if muted {
 		return
 	}
 	if streaming && conn != nil {
+		// only this goroutine sends audio, so what was held goes first, in order
+		for _, h := range held {
+			conn.Send(&api.VoiceAssistantAudio{Data: h})
+		}
 		conn.Send(&api.VoiceAssistantAudio{Data: pcm})
 		return
 	}
@@ -229,14 +250,18 @@ func (s *Satellite) start(phrase string, chime bool) {
 	}
 	s.pipeline, s.ttsURL, s.ttsPlayed, s.continueConv = true, "", false, false
 	s.heard, s.reply = "", ""
+	s.holding, s.held = true, nil // from the wake word on, nothing said is lost: no pause needed after it
+	s.run++
+	run := s.run
 	conn := s.conn
 	s.mu.Unlock()
 	s.setPhase(Listening)
 	begin := func() {
-		s.mu.Lock()
-		s.streaming = true
-		s.mu.Unlock()
+		// Audio is sent once Home Assistant has accepted the run (VoiceAssistantResponse): it empties its
+		// audio queue as the run starts, so anything sent before that, like what was said straight after
+		// the wake word, would be lost. Held meanwhile; a fallback in case the answer never comes.
 		conn.Send(&api.VoiceAssistantRequest{Start: true, WakeWordPhrase: phrase})
+		time.AfterFunc(startWait, func() { s.startStreaming(conn, run) })
 	}
 	if chime {
 		s.speaker.PlayPCM(Tone([2]float64{880, 70}, [2]float64{1320, 90}), SampleRate, 1, begin)
@@ -245,10 +270,20 @@ func (s *Satellite) start(phrase string, chime bool) {
 	}
 }
 
+// startStreaming sends the microphone (what was held first) to Home Assistant, once the run is accepted.
+func (s *Satellite) startStreaming(c *api.Conn, run int) {
+	s.mu.Lock()
+	if s.pipeline && s.holding && s.conn == c && s.run == run {
+		s.streaming = true
+	}
+	s.mu.Unlock()
+}
+
 func (s *Satellite) finish() {
 	s.mu.Lock()
 	cont := s.continueConv
 	s.continueConv, s.streaming, s.pipeline = false, false, false
+	s.holding, s.held = false, nil
 	conn := s.conn
 	s.mu.Unlock()
 	if conn != nil {
@@ -399,6 +434,7 @@ func (s *Satellite) Disconnected(c *api.Conn) {
 	s.mu.Lock()
 	if s.conn == c {
 		s.conn, s.streaming, s.pipeline = nil, false, false
+		s.holding, s.held = false, nil
 	}
 	s.mu.Unlock()
 	s.setPhase(Idle)
@@ -482,7 +518,12 @@ func (s *Satellite) Message(c *api.Conn, m proto.Message) {
 		if req.Error {
 			log.Printf("voice: Home Assistant refused the pipeline")
 			s.finish()
+			return
 		}
+		s.mu.Lock()
+		run := s.run
+		s.mu.Unlock()
+		s.startStreaming(c, run)
 	case *api.VoiceAssistantEventResponse:
 		s.event(req)
 	case *api.VoiceAssistantAnnounceRequest:
