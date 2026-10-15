@@ -28,8 +28,10 @@ Static armv7 binary:
 GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" ./cmd/pixeld
 ```
 
-`go test ./...` runs anywhere; the panel encoder's comparison against Govee's own renderer is skipped
-unless that renderer and its rootfs are available under `qemu-arm`.
+`go test ./...` runs anywhere. The panel encoder's bit-exact comparison against Govee's own renderer
+(`TestMatchesGovee`) runs only with `qemu-arm`, a reference renderer built against Govee's
+`libgovee_display.so`, and the stock rootfs it runs in (`PIXELD_ORACLE`, `PIXELD_SYSROOT`); otherwise it is
+skipped.
 
 Tagged releases (`v*`) are built by GitHub Actions and attached to the release as
 `pixeld-linux-armv7` with its SHA-256.

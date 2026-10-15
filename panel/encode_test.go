@@ -10,12 +10,20 @@ import (
 	"testing"
 )
 
-// Paths relative to this package. The oracle binary and the extracted base rootfs (qemu sysroot)
-// are colocated in this repo; no external workspace is needed.
-const (
-	oracleBin = "../../firmware-build/renderer/oracle/oracle"
-	sysroot   = "../../../firmware/extracted_1.00.91/rootfs_ext" // repo root: firmware/extracted_1.00.91/
+// The oracle (Govee's own renderer, built by the firmware workspace's renderer/oracle/build.sh) and the
+// extracted base rootfs it runs in under qemu-arm. Defaults: this repo as the firmware workspace's
+// pixeld submodule; override with PIXELD_ORACLE / PIXELD_SYSROOT.
+var (
+	oracleBin = envOr("PIXELD_ORACLE", "../../firmware-build/renderer/oracle/oracle")
+	sysroot   = envOr("PIXELD_SYSROOT", "../../extracted_1.00.91/rootfs_ext")
 )
+
+func envOr(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
+}
 
 func TestScale(t *testing.T) {
 	for _, c := range []struct{ in, want int }{{0, 0}, {1, 6}, {50, 129}, {73, 187}, {100, 255}} {
