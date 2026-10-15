@@ -241,3 +241,47 @@ func TestStopAndPauseFade(t *testing.T) {
 		t.Fatal("faded-out stream not dropped")
 	}
 }
+
+func TestVoiceStreamStartsBeforeDownloadEnds(t *testing.T) {
+	wav := wavStream(16000, 1, 16000, 5000) // 1 s of a reply
+	head, body := wav[:44+12], wav[44+12:]  // RIFF + fmt + LIST/INFO + data headers
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(head)
+		for p := 0; p < len(body); p += 3200 { // 100 ms of audio every 50 ms: faster than real time, but not all at once
+			w.Write(body[p:min(p+3200, len(body))])
+			w.(http.Flusher).Flush()
+			time.Sleep(50 * time.Millisecond)
+		}
+	}))
+	defer srv.Close()
+	s := testSpeaker()
+	done := make(chan struct{})
+	start := time.Now()
+	s.PlayVoiceStream(srv.URL, func() { close(done) })
+	var firstSound time.Duration
+	heard := 0
+	for i := 0; i < 400; i++ {
+		out, active := s.mix()
+		if !active {
+			break
+		}
+		if out[blockSamples/2] > 1000 {
+			if heard == 0 {
+				firstSound = time.Since(start)
+			}
+			heard++
+		}
+		time.Sleep(10 * time.Millisecond) // real time, like the output
+	}
+	if firstSound == 0 || firstSound > 400*time.Millisecond {
+		t.Fatalf("first sound after %v; the download takes ~500 ms", firstSound)
+	}
+	if heard < 95 || heard > 102 {
+		t.Fatalf("%d blocks of a 1 s reply", heard)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("done not called")
+	}
+}

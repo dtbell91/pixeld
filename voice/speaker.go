@@ -22,7 +22,8 @@ const (
 	OutRate      = 48000         // what the speaker is driven at (mono)
 	MusicRate    = 48000         // what Home Assistant is asked to convert music to
 	blockSamples = OutRate / 100 // 10 ms
-	idleBlocks   = 30            // keep the output open this long after the last sound
+	idleBlocks   = 30            // keep the amplifier on this long after the last sound
+	voicePrebuf  = OutRate / 10  // streamed voice sounds start once this much (100 ms) has arrived
 	musicBuffer  = 200           // blocks (2 s) of decoded music kept ahead of the output
 	duckDown     = 0.1           // music gain change per block when ducking (fast: ~70 ms to a voice level)
 	duckUp       = 0.04          // ... and coming back (~200 ms)
@@ -52,9 +53,12 @@ type Speaker struct {
 }
 
 type clip struct {
-	pcm  []int16 // mono at OutRate
-	pos  int
-	done func()
+	pcm     []int16 // mono at OutRate (streamed: what has arrived and not yet been played)
+	pos     int
+	src     *stream // streamed sound (nil: pcm is all of it)
+	srcDone bool    // the stream has ended
+	started bool    // a streamed sound has buffered enough and is playing
+	done    func()
 }
 
 type stream struct {
@@ -108,9 +112,35 @@ func (s *Speaker) PlayPCM(pcm []byte, rate, channels int, done func()) {
 	prev := s.voice
 	s.voice = c
 	s.mu.Unlock()
-	if prev != nil && prev.done != nil {
-		go prev.done()
+	prev.end()
+	s.poke()
+}
+
+// end cancels a replaced or stopped sound and runs its done.
+func (c *clip) end() {
+	if c == nil {
+		return
 	}
+	if c.src != nil {
+		c.src.cancel()
+	}
+	if c.done != nil {
+		go c.done()
+	}
+}
+
+// PlayVoiceStream plays a WAV from url (e.g. a reply as Home Assistant generates it) as a voice sound,
+// starting as soon as the first 100 ms have arrived, and calls done when it has finished.
+func (s *Speaker) PlayVoiceStream(url string, done func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	st := &stream{blocks: make(chan []int16, musicBuffer), cancel: cancel}
+	c := &clip{src: st, done: done}
+	s.mu.Lock()
+	prev := s.voice
+	s.voice = c
+	s.mu.Unlock()
+	prev.end()
+	go st.decode(ctx, url)
 	s.poke()
 }
 
@@ -133,9 +163,7 @@ func (s *Speaker) Stop() {
 	v := s.voice
 	s.voice = nil
 	s.mu.Unlock()
-	if v != nil && v.done != nil {
-		go v.done()
-	}
+	v.end()
 }
 
 // Playing reports whether a voice sound is playing.
@@ -230,9 +258,14 @@ func (st *stream) decode(ctx context.Context, url string) {
 	frame := channels * 2
 	buf := make([]byte, 1024*frame)
 	var pending []int16
+	have, first := 0, true
 	for {
-		n, rerr := io.ReadFull(br, buf)
-		n -= n % frame
+		n, rerr := br.Read(buf[have:]) // whatever has arrived: a streamed reply plays as it's generated
+		if first && n > 0 {
+			first = false
+		}
+		have += n
+		n = have - have%frame
 		mono := make([]int16, n/frame)
 		for i := range mono {
 			sum := 0
@@ -241,6 +274,7 @@ func (st *stream) decode(ctx context.Context, url string) {
 			}
 			mono[i] = int16(sum / channels)
 		}
+		have = copy(buf, buf[n:have])
 		pending = append(pending, rs.push(mono)...)
 		for len(pending) >= blockSamples {
 			b := make([]int16, blockSamples)
@@ -253,7 +287,7 @@ func (st *stream) decode(ctx context.Context, url string) {
 			}
 		}
 		if rerr != nil {
-			if !errors.Is(rerr, io.EOF) && !errors.Is(rerr, io.ErrUnexpectedEOF) && ctx.Err() == nil {
+			if !errors.Is(rerr, io.EOF) && ctx.Err() == nil {
 				st.err = rerr
 			}
 			if len(pending) > 0 { // the last few ms, padded to a block
@@ -272,12 +306,12 @@ func (st *stream) decode(ctx context.Context, url string) {
 // ---- output ----
 
 // run keeps the output open while there is something to play, mixing 10 ms at a time.
+// run keeps the output open all the time (silence when there's nothing to play), so a sound starts
+// without waiting for aplay and the codec to start; only the amplifier is switched, around sounds.
 func (s *Speaker) run() {
-	for range s.wake {
-		if !s.active() {
-			continue
-		}
-		s.playOut()
+	for {
+		s.playOut() // returns only if aplay fails
+		time.Sleep(time.Second)
 	}
 }
 
@@ -293,10 +327,10 @@ func (s *Speaker) playOut() {
 		dev = "plughw:0,0"
 	}
 	cmd := exec.Command("aplay", "-q", "-D", dev, "-t", "raw", "-f", "S16_LE", "-r", fmt.Sprint(OutRate), "-c", "1",
-		"--buffer-time=150000")
+		"--buffer-time=60000", "--period-time=10000")
 	// Our own pipe, kept small: what's written but not yet heard is at most the pipe plus aplay's buffer
-	// (~200 ms), so the silent tail below always plays out a sound's end before the amplifier goes off
-	// (a default 64 KB pipe held 0.7 s and cut the ends of replies), and ducking reacts quickly.
+	// (~100 ms). That's the delay before any sound and how fast ducking reacts, and the amplifier stays on
+	// long enough after a sound (idleBlocks) for its end to play out.
 	r, in, err := os.Pipe()
 	if err == nil {
 		syscall.Syscall(syscall.SYS_FCNTL, in.Fd(), fSetPipeSize, 4096)
@@ -310,41 +344,40 @@ func (s *Speaker) playOut() {
 			in.Close()
 		}
 		s.Stop() // don't leave a sound (and whatever waits for it) hanging
-		time.Sleep(time.Second)
 		return
 	}
-	// The amplifier is only on while the output is open and silent at both ends: switching it, or opening
-	// and closing the codec, with the other one live is what pops.
+	defer cmd.Wait()
+	defer in.Close()
+	// The amplifier is switched only while the output plays silence (switching it with sound going, or
+	// opening and closing the codec with it on, is what pops): it goes on as a sound is written, still
+	// ~100 ms ahead of it being heard, and off once idleBlocks of silence have followed the last sound.
 	out := make([]byte, blockSamples*2)
-	silence := func() {
-		clear(out)
-		for i := 0; i < ampSettle; i++ {
-			in.Write(out)
-		}
-	}
-	silence()
-	amp(true)
-	for idle := 0; idle < idleBlocks; {
+	ampOn, idle := false, 0
+	for {
 		block, active := s.mix()
-		if active {
+		switch {
+		case active:
 			idle = 0
-		} else {
-			idle++
+			if !ampOn {
+				amp(true)
+				ampOn = true
+			}
+		case ampOn:
+			if idle++; idle >= idleBlocks {
+				amp(false)
+				ampOn = false
+			}
 		}
 		for i, v := range block {
 			binary.LittleEndian.PutUint16(out[i*2:], uint16(v))
 		}
 		if _, err := in.Write(out); err != nil {
 			log.Printf("voice: aplay: %v", err)
-			break
+			if ampOn {
+				amp(false)
+			}
+			return
 		}
-	}
-	amp(false)
-	silence()
-	in.Close()
-	cmd.Wait()
-	if s.active() {
-		s.poke() // something started while closing: open again
 	}
 }
 
@@ -360,12 +393,21 @@ func (s *Speaker) mix() ([]int16, bool) {
 	var finished *clip
 	active := s.voice != nil
 	if v := s.voice; v != nil {
-		target = math.Min(target, voiceDuck)
-		for i := 0; i < blockSamples && v.pos < len(v.pcm); i++ {
-			acc[i] += float64(v.pcm[v.pos])
-			v.pos++
+		target = math.Min(target, voiceDuck) // duck as soon as a reply is coming, not only once it's heard
+		if v.src != nil {
+			v.fill()
 		}
-		if v.pos >= len(v.pcm) {
+		if !v.started && (v.src == nil || v.srcDone || len(v.pcm)-v.pos >= voicePrebuf) {
+			v.started = true
+		}
+		if v.started {
+			for i := 0; i < blockSamples && v.pos < len(v.pcm); i++ {
+				acc[i] += float64(v.pcm[v.pos])
+				v.pos++
+			}
+			// a streamed sound that hasn't caught up leaves a gap rather than holding up the music
+		}
+		if v.pos >= len(v.pcm) && (v.src == nil || v.srcDone) {
 			finished, s.voice = v, nil
 		}
 	}
@@ -423,14 +465,38 @@ func (s *Speaker) mix() ([]int16, bool) {
 		default: // the stream hasn't caught up: a gap rather than holding up voice sounds
 		}
 	}
-	if finished != nil && finished.done != nil {
-		go finished.done()
+	if finished != nil {
+		if finished.src != nil && finished.src.err != nil {
+			log.Printf("voice: sound stream: %v", finished.src.err)
+		}
+		if finished.done != nil {
+			go finished.done()
+		}
 	}
 	out := make([]int16, blockSamples)
 	for i, v := range acc {
 		out[i] = int16(math.Max(-32768, math.Min(32767, v*gain)))
 	}
 	return out, active
+}
+
+// fill takes whatever a streamed sound's decoder has ready, without waiting.
+func (c *clip) fill() {
+	if c.pos > 0 {
+		c.pcm, c.pos = c.pcm[c.pos:], 0
+	}
+	for {
+		select {
+		case b, ok := <-c.src.blocks:
+			if !ok {
+				c.srcDone = true
+				return
+			}
+			c.pcm = append(c.pcm, b...)
+		default:
+			return
+		}
+	}
 }
 
 // ---- formats ----

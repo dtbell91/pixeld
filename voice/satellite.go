@@ -4,11 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
 	"log"
 	"math"
-	"net/http"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -156,8 +153,8 @@ func (s *Satellite) Phase() Phase {
 // duckFor is how loud music stays while the satellite is busy.
 func duckFor(p Phase) float64 {
 	switch p {
-	case Listening:
-		return 0.1
+	case Listening: // silent: without echo cancellation even quiet music spoils speech recognition
+		return 0
 	case Thinking, TimerRinging:
 		return 0.2
 	case Speaking, Error:
@@ -264,32 +261,9 @@ func (s *Satellite) finish() {
 	s.setPhase(Idle)
 }
 
-// playURL fetches a WAV from Home Assistant and plays it, then calls done.
+// playURL plays a WAV from Home Assistant (a reply, an announcement) as it arrives, then calls done.
 func (s *Satellite) playURL(url string, done func()) {
-	go func() {
-		data, err := fetch(url)
-		if err == nil {
-			err = s.speaker.PlayWAV(data, done)
-		} else if done != nil {
-			done()
-		}
-		if err != nil {
-			log.Printf("voice: play %s: %v", url, err)
-		}
-	}()
-}
-
-func fetch(url string) ([]byte, error) {
-	c := http.Client{Timeout: 30 * time.Second}
-	r, err := c.Get(url)
-	if err != nil {
-		return nil, err
-	}
-	defer r.Body.Close()
-	if r.StatusCode != 200 {
-		return nil, fmt.Errorf("HTTP %d", r.StatusCode)
-	}
-	return io.ReadAll(io.LimitReader(r.Body, 16<<20))
+	s.speaker.PlayVoiceStream(url, done)
 }
 
 func (s *Satellite) playTTS() {
