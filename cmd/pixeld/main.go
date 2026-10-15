@@ -30,6 +30,7 @@ import (
 	"bufio"
 	"context"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -76,7 +77,12 @@ func main() {
 	ddpAddr := flag.String("ddp", ":4048", "DDP (UDP) listen address for live frames; empty to disable")
 	gameAddr := flag.String("game", ":8080", "Pac-Man controller page (HTTP); empty to disable")
 	voiceAddr := flag.String("voice", ":6053", "voice satellite (ESPHome API); empty to disable")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(version)
+		return
+	}
 
 	env := readEnv(*envPath)
 	for _, k := range []string{"MQTT_HOST", "MQTT_PORT", "MQTT_USER", "MQTT_PASS", "MQTT_PREFIX"} {

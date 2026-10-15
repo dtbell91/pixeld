@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
@@ -26,6 +27,7 @@ import (
 	"pixeld/hw"
 	"pixeld/panel"
 	"pixeld/player"
+	"pixeld/selfupdate"
 	"pixeld/voice"
 )
 
@@ -71,6 +73,8 @@ type app struct {
 	lastState []byte
 	voice     *voice.Satellite
 	sat       atomic.Pointer[voice.Satellite] // = voice, for cards drawing on the player's goroutine
+	app       selfupdate.Dir                  // where updated builds go ("" = firmware can't run them)
+	confirm   sync.Once                       // a trial build confirms itself once
 }
 
 const timerSlot = 10 * time.Second // the timers' own turn in the rotation while any are running
@@ -403,6 +407,9 @@ func run(ctx context.Context, cfg config) error {
 		return err
 	}
 	a := &app{cfg: cfg, frames: map[string][]content.Frame{}, missing: map[string]bool{}}
+	if !cfg.sim {
+		a.app = selfupdate.FromEnv()
+	}
 
 	var sink player.Sink
 	if cfg.sim {
@@ -452,8 +459,10 @@ func run(ctx context.Context, cfg config) error {
 	opts.SetOnConnectHandler(func(c mqtt.Client) {
 		log.Printf("mqtt connected")
 		c.Publish(a.topic("px/status"), 1, true, "online")
-		info, _ := json.Marshal(deviceInfo(cfg.sim))
-		c.Publish(a.topic("px/info"), 1, true, info)
+		info := deviceInfo(cfg.sim)
+		info["updates"], info["slot"] = a.app != "", a.slot()
+		infoJSON, _ := json.Marshal(info)
+		c.Publish(a.topic("px/info"), 1, true, infoJSON)
 		a.mu.Lock()
 		if a.lastState != nil {
 			c.Publish(a.topic("px/state"), 1, true, a.lastState)
@@ -461,8 +470,11 @@ func run(ctx context.Context, cfg config) error {
 		a.mu.Unlock()
 		c.SubscribeMultiple(map[string]byte{
 			a.topic("px/set"): 1, a.topic("px/show"): 1, a.topic("px/playlist"): 1, a.topic("px/content/+"): 1,
+			a.topic("px/update/+"): 1,
 		}, func(_ mqtt.Client, m mqtt.Message) {
 			switch t := m.Topic(); {
+			case strings.HasPrefix(t, a.topic("px/update/")):
+				go a.onUpdate(strings.TrimPrefix(t, a.topic("px/update/")), m)
 			case t == a.topic("px/set"):
 				a.onSet(nil, m)
 			case t == a.topic("px/show"):
@@ -474,6 +486,7 @@ func run(ctx context.Context, cfg config) error {
 			}
 		})
 		go a.requestMissing()
+		a.updateStarted()
 	})
 	opts.SetConnectionLostHandler(func(_ mqtt.Client, err error) { log.Printf("mqtt connection lost: %v", err) })
 	a.client = mqtt.NewClient(opts)
@@ -539,4 +552,85 @@ func deviceInfo(sim bool) map[string]any {
 	t := hw.ReadTelemetry(version)
 	info["firmware"], info["base"] = t.Firmware, t.Base
 	return info
+}
+
+// ---- updates (see selfupdate) ----
+
+// updateMsg is published retained on px/update/state.
+type updateMsg struct {
+	State   string `json:"state"` // installing, restarting, trial, ok, rolled_back, failed
+	Version string `json:"version"`
+	Detail  string `json:"detail,omitempty"`
+}
+
+func (a *app) updateState(state, detail string) {
+	if state == "failed" || state == "rolled_back" {
+		log.Printf("update: %s %s", state, detail)
+	} else {
+		log.Printf("update: %s", state)
+	}
+	a.publishJSON("px/update/state", true, updateMsg{State: state, Version: version, Detail: detail})
+}
+
+// slot is which build is running: trial, current or builtin.
+func (a *app) slot() string {
+	if s := a.app.Running(); s != "" {
+		return s
+	}
+	return "builtin"
+}
+
+// updateStarted (on each MQTT connect) reports a trial the launcher rolled back, and lets a trial build
+// confirm itself once it has stayed connected for a minute.
+func (a *app) updateStarted() {
+	if a.app.TakeRejected() {
+		a.updateState("rolled_back", "the new build failed its trial; back on "+version)
+	}
+	if a.app.Running() != selfupdate.Trial {
+		return
+	}
+	a.confirm.Do(func() {
+		a.updateState("trial", "")
+		go func() {
+			time.Sleep(time.Minute)
+			for !a.client.IsConnected() {
+				time.Sleep(5 * time.Second)
+			}
+			if err := a.app.Confirm(); err != nil {
+				a.updateState("failed", "confirm: "+err.Error())
+				return
+			}
+			a.updateState("ok", "")
+		}()
+	})
+}
+
+// onUpdate: px/update/<sha256> carries a gzipped build to install; px/update/rollback goes back to the
+// previous one. Either way pixeld then restarts into it (the launcher runs it on trial).
+func (a *app) onUpdate(what string, m mqtt.Message) {
+	if m.Retained() { // only act on fresh requests
+		return
+	}
+	switch {
+	case what == "rollback":
+		if err := a.app.Rollback(); err != nil {
+			a.updateState("failed", err.Error())
+			return
+		}
+	case reKey.MatchString(what):
+		if sum, err := selfupdate.Sum(); err == nil && sum == what {
+			a.updateState("ok", "already running this build")
+			return
+		}
+		a.updateState("installing", "")
+		if err := a.app.Install(m.Payload(), what); err != nil {
+			a.updateState("failed", err.Error())
+			return
+		}
+	default:
+		return
+	}
+	a.updateState("restarting", "")
+	time.Sleep(time.Second) // let the state go out
+	syscall.Kill(os.Getpid(), syscall.SIGTERM)
 }
