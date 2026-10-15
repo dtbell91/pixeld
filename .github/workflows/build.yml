@@ -30,7 +30,7 @@ jobs:
           go build -trimpath -buildvcs=false -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" \
             -o dist/pixeld-linux-armv7 ./cmd/pixeld
           cd dist && sha256sum pixeld-linux-armv7 > pixeld-linux-armv7.sha256
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v6
         with:
           name: pixeld-linux-armv7
           path: dist/
