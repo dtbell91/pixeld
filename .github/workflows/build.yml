@@ -1,0 +1,41 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test ./...
+      - name: build armv7
+        env:
+          GOOS: linux
+          GOARCH: arm
+          GOARM: "7"
+          CGO_ENABLED: "0"
+        run: |
+          mkdir dist
+          go build -trimpath -buildvcs=false -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" \
+            -o dist/pixeld-linux-armv7 ./cmd/pixeld
+          cd dist && sha256sum pixeld-linux-armv7 > pixeld-linux-armv7.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pixeld-linux-armv7
+          path: dist/
+      - name: release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes
