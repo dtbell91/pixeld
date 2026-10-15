@@ -459,10 +459,7 @@ func run(ctx context.Context, cfg config) error {
 	opts.SetOnConnectHandler(func(c mqtt.Client) {
 		log.Printf("mqtt connected")
 		c.Publish(a.topic("px/status"), 1, true, "online")
-		info := deviceInfo(cfg.sim)
-		info["updates"], info["slot"] = a.app != "", a.slot()
-		infoJSON, _ := json.Marshal(info)
-		c.Publish(a.topic("px/info"), 1, true, infoJSON)
+		a.publishInfo()
 		a.mu.Lock()
 		if a.lastState != nil {
 			c.Publish(a.topic("px/state"), 1, true, a.lastState)
@@ -572,6 +569,13 @@ func (a *app) updateState(state, detail string) {
 	a.publishJSON("px/update/state", true, updateMsg{State: state, Version: version, Detail: detail})
 }
 
+// publishInfo announces the light (px/info, retained), incl. which build is running.
+func (a *app) publishInfo() {
+	info := deviceInfo(a.cfg.sim)
+	info["updates"], info["slot"] = a.app != "", a.slot()
+	a.publishJSON("px/info", true, info)
+}
+
 // slot is which build is running: trial, current or builtin.
 func (a *app) slot() string {
 	if s := a.app.Running(); s != "" {
@@ -600,6 +604,7 @@ func (a *app) updateStarted() {
 				a.updateState("failed", "confirm: "+err.Error())
 				return
 			}
+			a.publishInfo() // now running as current
 			a.updateState("ok", "")
 		}()
 	})
