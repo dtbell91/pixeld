@@ -2,9 +2,10 @@ package selfupdate
 
 import (
 	"bytes"
-	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -18,12 +19,8 @@ func armELF() []byte {
 }
 
 func pack(b []byte) ([]byte, string) {
-	var buf bytes.Buffer
-	w := gzip.NewWriter(&buf)
-	w.Write(b)
-	w.Close()
 	s := sha256.Sum256(b)
-	return buf.Bytes(), hex.EncodeToString(s[:])
+	return b, hex.EncodeToString(s[:])
 }
 
 func TestInstallChecks(t *testing.T) {
@@ -37,9 +34,6 @@ func TestInstallChecks(t *testing.T) {
 	gzx, sumx := pack(x86)
 	if err := d.Install(gzx, sumx); err == nil {
 		t.Fatal("accepted a non-ARM binary")
-	}
-	if err := d.Install([]byte("nope"), sum); err == nil {
-		t.Fatal("accepted non-gzip")
 	}
 	os.WriteFile(filepath.Join(string(d), Tries), []byte("2"), 0o644)
 	if err := d.Install(gz, sum); err != nil {
@@ -104,5 +98,23 @@ func TestConfirm(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(string(d), gone)); err == nil {
 			t.Errorf("%s left behind", gone)
 		}
+	}
+}
+
+func TestDownload(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/build" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write(armELF())
+	}))
+	defer srv.Close()
+	bin, err := Download(srv.URL + "/build")
+	if err != nil || !bytes.Equal(bin, armELF()) {
+		t.Fatalf("download: %v", err)
+	}
+	if _, err := Download(srv.URL + "/gone"); err == nil {
+		t.Fatal("404 accepted")
 	}
 }

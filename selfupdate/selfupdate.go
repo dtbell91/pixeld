@@ -14,15 +14,15 @@
 package selfupdate
 
 import (
-	"bytes"
-	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 const (
@@ -76,22 +76,32 @@ func (d Dir) Running() string {
 	return ""
 }
 
-// Install unpacks a gzipped armv7 pixeld, checks it against sha256 (hex) and installs it as the trial.
-// The caller then restarts so the launcher runs it.
-func (d Dir) Install(gz []byte, sum string) error {
-	if d == "" {
-		return ErrUnsupported
-	}
-	zr, err := gzip.NewReader(bytes.NewReader(gz))
+// Download fetches a build (e.g. from Home Assistant) for Install.
+func Download(url string) ([]byte, error) {
+	c := http.Client{Timeout: 5 * time.Minute}
+	r, err := c.Get(url)
 	if err != nil {
-		return fmt.Errorf("not gzip: %w", err)
+		return nil, err
 	}
-	bin, err := io.ReadAll(io.LimitReader(zr, maxSize+1))
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", r.StatusCode)
+	}
+	bin, err := io.ReadAll(io.LimitReader(r.Body, maxSize+1))
 	if err != nil {
-		return fmt.Errorf("unpack: %w", err)
+		return nil, err
 	}
 	if len(bin) > maxSize {
-		return errors.New("too big")
+		return nil, errors.New("too big")
+	}
+	return bin, nil
+}
+
+// Install checks an armv7 pixeld against sha256 (hex) and installs it as the trial. The caller then
+// restarts so the launcher runs it.
+func (d Dir) Install(bin []byte, sum string) error {
+	if d == "" {
+		return ErrUnsupported
 	}
 	if got := sha256.Sum256(bin); hex.EncodeToString(got[:]) != sum {
 		return errors.New("checksum mismatch")

@@ -605,29 +605,45 @@ func (a *app) updateStarted() {
 	})
 }
 
-// onUpdate: px/update/<sha256> carries a gzipped build to install; px/update/rollback goes back to the
-// previous one. Either way pixeld then restarts into it (the launcher runs it on trial).
+// installMsg (px/update/install): where to download a build (Home Assistant serves it) and its SHA-256.
+type installMsg struct {
+	URL    string `json:"url"`
+	SHA256 string `json:"sha256"`
+}
+
+// onUpdate: px/update/install fetches and installs a build; px/update/rollback goes back to the previous
+// one. Either way pixeld then restarts into it (the launcher runs it on trial). Builds are fetched over
+// HTTP rather than sent over MQTT, as brokers commonly limit message size.
 func (a *app) onUpdate(what string, m mqtt.Message) {
 	if m.Retained() { // only act on fresh requests
 		return
 	}
-	switch {
-	case what == "rollback":
+	switch what {
+	case "rollback":
 		if err := a.app.Rollback(); err != nil {
 			a.updateState("failed", err.Error())
 			return
 		}
-	case reKey.MatchString(what):
-		if sum, err := selfupdate.Sum(); err == nil && sum == what {
+	case "install":
+		var req installMsg
+		if err := json.Unmarshal(m.Payload(), &req); err != nil || req.URL == "" || !reKey.MatchString(req.SHA256) {
+			a.updateState("failed", "bad install request")
+			return
+		}
+		if sum, err := selfupdate.Sum(); err == nil && sum == req.SHA256 {
 			a.updateState("ok", "already running this build")
 			return
 		}
 		a.updateState("installing", "")
-		if err := a.app.Install(m.Payload(), what); err != nil {
+		bin, err := selfupdate.Download(req.URL)
+		if err == nil {
+			err = a.app.Install(bin, req.SHA256)
+		}
+		if err != nil {
 			a.updateState("failed", err.Error())
 			return
 		}
-	default:
+	default: // e.g. our own px/update/state
 		return
 	}
 	a.updateState("restarting", "")
