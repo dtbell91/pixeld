@@ -4,7 +4,6 @@
 package voice
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -14,7 +13,6 @@ import (
 	"math"
 	"os"
 	"os/exec"
-	"sync"
 	"time"
 )
 
@@ -71,113 +69,12 @@ func Capture(ctx context.Context, fn func(pcm []byte)) {
 	}
 }
 
-// Speaker plays one sound at a time through aplay, with the amplifier switched on only while playing.
-type Speaker struct {
-	mu     sync.Mutex
-	cancel context.CancelFunc
-	done   chan struct{}
-	volume float64 // 0..1
-	muted  bool
-}
-
-func NewSpeaker(volume float64) *Speaker { return &Speaker{volume: volume} }
-
-func (s *Speaker) SetVolume(v float64) {
-	s.mu.Lock()
-	s.volume = math.Max(0, math.Min(1, v))
-	s.mu.Unlock()
-}
-
 func amp(on bool) {
 	v := "0"
 	if on {
 		v = "1"
 	}
 	os.WriteFile(ampGPIO, []byte(v), 0)
-}
-
-func (s *Speaker) SetMuted(m bool) {
-	s.mu.Lock()
-	s.muted = m
-	s.mu.Unlock()
-}
-
-// Stop ends whatever is playing (its done callback still runs).
-func (s *Speaker) Stop() {
-	s.mu.Lock()
-	cancel, done := s.cancel, s.done
-	s.mu.Unlock()
-	if cancel != nil {
-		cancel()
-		<-done
-	}
-}
-
-// Playing reports whether something is playing.
-func (s *Speaker) Playing() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.cancel != nil
-}
-
-// PlayPCM plays 16-bit PCM (interrupting anything playing) and calls done (may be nil) when finished.
-func (s *Speaker) PlayPCM(pcm []byte, rate, channels int, done func()) {
-	s.Stop()
-	ctx, cancel := context.WithCancel(context.Background())
-	finished := make(chan struct{})
-	s.mu.Lock()
-	s.cancel, s.done = cancel, finished
-	vol := s.volume
-	if s.muted {
-		vol = 0
-	}
-	s.mu.Unlock()
-	go func() {
-		defer func() {
-			s.mu.Lock()
-			if s.done == finished {
-				s.cancel, s.done = nil, nil
-			}
-			s.mu.Unlock()
-			close(finished)
-			if done != nil {
-				done()
-			}
-		}()
-		scaled := make([]byte, len(pcm))
-		gain := vol * vol // perceptual-ish curve
-		for i := 0; i+1 < len(pcm); i += 2 {
-			v := float64(int16(binary.LittleEndian.Uint16(pcm[i:])))
-			binary.LittleEndian.PutUint16(scaled[i:], uint16(int16(math.Max(-32768, math.Min(32767, v*gain)))))
-		}
-		amp(true)
-		defer func() {
-			time.AfterFunc(300*time.Millisecond, func() {
-				if !s.Playing() {
-					amp(false)
-				}
-			})
-		}()
-		cmd := exec.CommandContext(ctx, "aplay", "-q", "-D", "plughw:0,0", "-t", "raw", "-f", "S16_LE",
-			"-r", fmt.Sprint(rate), "-c", fmt.Sprint(channels))
-		cmd.Stdin = bytes.NewReader(scaled)
-		if err := cmd.Run(); err != nil && ctx.Err() == nil {
-			log.Printf("voice: aplay: %v", err)
-		}
-	}()
-}
-
-// PlayWAV plays a PCM WAV file's contents.
-func (s *Speaker) PlayWAV(data []byte, done func()) error {
-	pcm, rate, ch, err := ParseWAV(data)
-	if err != nil {
-		if done != nil {
-			done()
-		}
-		return err
-	}
-	s.PlayPCM(pcm, rate, ch, done)
-	return nil
 }
 
 // ParseWAV returns the 16-bit PCM samples of a WAV file.

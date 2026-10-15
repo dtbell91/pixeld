@@ -3,12 +3,13 @@ package voice
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -33,6 +34,8 @@ const (
 	mpStop        = 1 << 12
 	mpPlay        = 1 << 14
 	mpAnnounce    = 1 << 20
+	mpEnqueue     = 1 << 21
+	mpVolumeStep  = 1 << 10
 	mediaKey      = 1
 	maxActiveWake = 2
 	timerRingMax  = 30 * time.Second
@@ -78,8 +81,11 @@ type Satellite struct {
 	ttsPlayed    bool
 	continueConv bool
 	ringing      bool
-	ringName     string // the timer that's ringing
-	mpState      api.MediaPlayerState
+	ringName     string               // the timer that's ringing
+	musicState   api.MediaPlayerState // idle, playing or paused
+	announcing   int                  // announcements playing (shown as the media player's state meanwhile)
+	queue        []string             // music URLs enqueued after the current one
+	musicGen     int                  // which playMusic is current
 
 	// shown on the panel
 	heard, reply    string // what was understood / is being said back (or announced)
@@ -90,7 +96,7 @@ type Satellite struct {
 }
 
 func NewSatellite(modelDir, mwwBin string) *Satellite {
-	s := &Satellite{models: LoadModels(modelDir), cfg: Config{Volume: 0.8}, mpState: api.MediaPlayerState_MEDIA_PLAYER_STATE_IDLE,
+	s := &Satellite{models: LoadModels(modelDir), cfg: Config{Volume: 0.8}, musicState: api.MediaPlayerState_MEDIA_PLAYER_STATE_IDLE,
 		timers: map[string]*voiceTimer{}}
 	s.detector = NewDetector(mwwBin, s.models, s.onWake)
 	return s
@@ -145,11 +151,27 @@ func (s *Satellite) Phase() Phase {
 	return s.phase
 }
 
+// duckFor is how loud music stays while the satellite is busy.
+func duckFor(p Phase) float64 {
+	switch p {
+	case Listening:
+		return 0.1
+	case Thinking, TimerRinging:
+		return 0.2
+	case Speaking, Error:
+		return 0.3
+	}
+	return 1
+}
+
 func (s *Satellite) setPhase(p Phase) {
 	s.mu.Lock()
 	changed := s.phase != p
 	s.phase = p
 	s.mu.Unlock()
+	if s.speaker != nil {
+		s.speaker.SetDuck(duckFor(p))
+	}
 	if changed && s.OnPhase != nil {
 		s.OnPhase(p)
 	}
@@ -409,17 +431,36 @@ func (s *Satellite) Disconnected(c *api.Conn) {
 func (s *Satellite) mediaState() *api.MediaPlayerStateResponse {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return &api.MediaPlayerStateResponse{Key: mediaKey, State: s.mpState, Volume: float32(s.cfg.Volume), Muted: s.cfg.SpeakerMuted}
+	st := s.musicState
+	if s.announcing > 0 {
+		st = api.MediaPlayerState_MEDIA_PLAYER_STATE_ANNOUNCING
+	}
+	return &api.MediaPlayerStateResponse{Key: mediaKey, State: st, Volume: float32(s.cfg.Volume), Muted: s.cfg.SpeakerMuted}
 }
 
-func (s *Satellite) setMediaState(st api.MediaPlayerState) {
+// sendMediaState tells Home Assistant the media player's state.
+func (s *Satellite) sendMediaState() {
 	s.mu.Lock()
-	s.mpState = st
 	c := s.conn
 	s.mu.Unlock()
 	if c != nil {
 		c.Send(s.mediaState())
 	}
+}
+
+func (s *Satellite) setMusicState(st api.MediaPlayerState) {
+	s.mu.Lock()
+	s.musicState = st
+	s.mu.Unlock()
+	s.sendMediaState()
+}
+
+// setAnnouncing counts an announcement starting (+1) or ending (-1).
+func (s *Satellite) setAnnouncing(d int) {
+	s.mu.Lock()
+	s.announcing = max(0, s.announcing+d)
+	s.mu.Unlock()
+	s.sendMediaState()
 }
 
 func (s *Satellite) Message(c *api.Conn, m proto.Message) {
@@ -433,12 +474,12 @@ func (s *Satellite) Message(c *api.Conn, m proto.Message) {
 		})
 	case *api.ListEntitiesRequest:
 		formats := []*api.MediaPlayerSupportedFormat{
-			{Format: "wav", SampleRate: SampleRate, NumChannels: 1, SampleBytes: 2, Purpose: api.MediaPlayerFormatPurpose_MEDIA_PLAYER_FORMAT_PURPOSE_DEFAULT},
+			{Format: "wav", SampleRate: MusicRate, NumChannels: 1, SampleBytes: 2, Purpose: api.MediaPlayerFormatPurpose_MEDIA_PLAYER_FORMAT_PURPOSE_DEFAULT},
 			{Format: "wav", SampleRate: SampleRate, NumChannels: 1, SampleBytes: 2, Purpose: api.MediaPlayerFormatPurpose_MEDIA_PLAYER_FORMAT_PURPOSE_ANNOUNCEMENT},
 		}
 		c.Send(&api.ListEntitiesMediaPlayerResponse{
 			ObjectId: "speaker", Key: mediaKey, Name: "Speaker", SupportsPause: true, SupportedFormats: formats,
-			FeatureFlags: mpPause | mpVolumeSet | mpVolumeMute | mpPlayMedia | mpStop | mpPlay | mpAnnounce,
+			FeatureFlags: mpPause | mpVolumeSet | mpVolumeMute | mpPlayMedia | mpStop | mpPlay | mpAnnounce | mpEnqueue | mpVolumeStep,
 		}, &api.ListEntitiesDoneResponse{})
 	case *api.SubscribeStatesRequest:
 		c.Send(s.mediaState())
@@ -485,9 +526,9 @@ func (s *Satellite) Message(c *api.Conn, m proto.Message) {
 
 func (s *Satellite) announce(pre, url string, startConversation bool) {
 	s.setPhase(Speaking)
-	s.setMediaState(api.MediaPlayerState_MEDIA_PLAYER_STATE_ANNOUNCING)
+	s.setAnnouncing(1)
 	after := func() {
-		s.setMediaState(api.MediaPlayerState_MEDIA_PLAYER_STATE_IDLE)
+		s.setAnnouncing(-1)
 		s.mu.Lock()
 		s.continueConv = startConversation
 		s.mu.Unlock()
@@ -502,39 +543,124 @@ func (s *Satellite) announce(pre, url string, startConversation bool) {
 
 func (s *Satellite) mediaCommand(req *api.MediaPlayerCommandRequest) {
 	if req.HasVolume {
-		s.mu.Lock()
-		s.cfg.Volume = float64(req.Volume)
-		s.saveConfig()
-		s.notice = notice{kind: noticeVolume, level: s.cfg.Volume, on: !s.cfg.SpeakerMuted, at: time.Now()}
-		s.mu.Unlock()
-		s.speaker.SetVolume(float64(req.Volume))
-		s.setMediaState(s.mediaState().State)
+		s.setVolume(float64(req.Volume))
 	}
 	if req.HasMediaUrl && req.MediaUrl != "" {
 		url := req.MediaUrl
-		if !strings.Contains(strings.ToLower(url), ".wav") && !strings.Contains(url, "tts_proxy") {
-			log.Printf("voice: only WAV media is supported for now (%s)", url)
-		}
-		st := api.MediaPlayerState_MEDIA_PLAYER_STATE_PLAYING
-		if req.HasAnnouncement && req.Announcement {
-			st = api.MediaPlayerState_MEDIA_PLAYER_STATE_ANNOUNCING
-		}
-		s.setMediaState(st)
-		s.playURL(url, func() { s.setMediaState(api.MediaPlayerState_MEDIA_PLAYER_STATE_IDLE) })
-	}
-	if req.HasCommand {
-		switch req.Command {
-		case api.MediaPlayerCommand_MEDIA_PLAYER_COMMAND_STOP, api.MediaPlayerCommand_MEDIA_PLAYER_COMMAND_PAUSE:
-			s.speaker.Stop()
-			s.setMediaState(api.MediaPlayerState_MEDIA_PLAYER_STATE_IDLE)
-		case api.MediaPlayerCommand_MEDIA_PLAYER_COMMAND_MUTE, api.MediaPlayerCommand_MEDIA_PLAYER_COMMAND_UNMUTE:
+		switch {
+		case req.HasAnnouncement && req.Announcement: // over the music (ducked), like a reply
+			s.setAnnouncing(1)
+			s.playURL(url, func() { s.setAnnouncing(-1) })
+		case req.HasCommand && req.Command == api.MediaPlayerCommand_MEDIA_PLAYER_COMMAND_ENQUEUE && s.speaker.MusicActive():
 			s.mu.Lock()
-			s.cfg.SpeakerMuted = req.Command == api.MediaPlayerCommand_MEDIA_PLAYER_COMMAND_MUTE
-			s.saveConfig()
-			s.notice = notice{kind: noticeVolume, level: s.cfg.Volume, on: !s.cfg.SpeakerMuted, at: time.Now()}
+			s.queue = append(s.queue, url)
 			s.mu.Unlock()
-			s.speaker.SetMuted(s.cfg.SpeakerMuted)
-			s.setMediaState(s.mediaState().State)
+		default:
+			s.mu.Lock()
+			s.queue = nil
+			s.mu.Unlock()
+			s.playMusic(url)
 		}
+		return
+	}
+	if !req.HasCommand {
+		return
+	}
+	switch req.Command {
+	case api.MediaPlayerCommand_MEDIA_PLAYER_COMMAND_PLAY:
+		s.pauseMusic(false)
+	case api.MediaPlayerCommand_MEDIA_PLAYER_COMMAND_PAUSE:
+		s.pauseMusic(true)
+	case api.MediaPlayerCommand_MEDIA_PLAYER_COMMAND_TOGGLE:
+		s.mu.Lock()
+		playing := s.musicState == api.MediaPlayerState_MEDIA_PLAYER_STATE_PLAYING
+		s.mu.Unlock()
+		s.pauseMusic(playing)
+	case api.MediaPlayerCommand_MEDIA_PLAYER_COMMAND_STOP:
+		s.mu.Lock()
+		s.queue = nil
+		s.musicGen++
+		s.mu.Unlock()
+		s.speaker.StopMusic()
+		s.speaker.Stop()
+		s.setMusicState(api.MediaPlayerState_MEDIA_PLAYER_STATE_IDLE)
+	case api.MediaPlayerCommand_MEDIA_PLAYER_COMMAND_CLEAR_PLAYLIST:
+		s.mu.Lock()
+		s.queue = nil
+		s.mu.Unlock()
+	case api.MediaPlayerCommand_MEDIA_PLAYER_COMMAND_VOLUME_UP, api.MediaPlayerCommand_MEDIA_PLAYER_COMMAND_VOLUME_DOWN:
+		s.mu.Lock()
+		v := s.cfg.Volume
+		s.mu.Unlock()
+		if req.Command == api.MediaPlayerCommand_MEDIA_PLAYER_COMMAND_VOLUME_UP {
+			s.setVolume(v + 0.1)
+		} else {
+			s.setVolume(v - 0.1)
+		}
+	case api.MediaPlayerCommand_MEDIA_PLAYER_COMMAND_MUTE, api.MediaPlayerCommand_MEDIA_PLAYER_COMMAND_UNMUTE:
+		s.mu.Lock()
+		s.cfg.SpeakerMuted = req.Command == api.MediaPlayerCommand_MEDIA_PLAYER_COMMAND_MUTE
+		s.saveConfig()
+		s.notice = notice{kind: noticeVolume, level: s.cfg.Volume, on: !s.cfg.SpeakerMuted, at: time.Now()}
+		s.mu.Unlock()
+		s.speaker.SetMuted(s.cfg.SpeakerMuted)
+		s.sendMediaState()
+	}
+}
+
+func (s *Satellite) setVolume(v float64) {
+	v = math.Max(0, math.Min(1, v))
+	s.mu.Lock()
+	s.cfg.Volume = v
+	s.saveConfig()
+	s.notice = notice{kind: noticeVolume, level: v, on: !s.cfg.SpeakerMuted, at: time.Now()}
+	s.mu.Unlock()
+	s.speaker.SetVolume(v)
+	s.sendMediaState()
+}
+
+// playMusic streams url (Home Assistant converts it to the WAV format we asked for), then whatever was
+// enqueued after it.
+func (s *Satellite) playMusic(url string) {
+	s.mu.Lock()
+	s.musicGen++
+	gen := s.musicGen
+	s.mu.Unlock()
+	log.Printf("voice: playing music")
+	s.setMusicState(api.MediaPlayerState_MEDIA_PLAYER_STATE_PLAYING)
+	s.speaker.PlayStream(url, func(err error) {
+		if errors.Is(err, ErrStopped) {
+			return // stopped or replaced: that set the state
+		}
+		if err != nil {
+			log.Printf("voice: music stream: %v", err)
+		}
+		s.mu.Lock()
+		if gen != s.musicGen {
+			s.mu.Unlock()
+			return
+		}
+		var next string
+		if len(s.queue) > 0 {
+			next, s.queue = s.queue[0], s.queue[1:]
+		}
+		s.mu.Unlock()
+		if next != "" {
+			s.playMusic(next)
+			return
+		}
+		s.setMusicState(api.MediaPlayerState_MEDIA_PLAYER_STATE_IDLE)
+	})
+}
+
+func (s *Satellite) pauseMusic(paused bool) {
+	if !s.speaker.MusicActive() {
+		return
+	}
+	s.speaker.PauseMusic(paused)
+	if paused {
+		s.setMusicState(api.MediaPlayerState_MEDIA_PLAYER_STATE_PAUSED)
+	} else {
+		s.setMusicState(api.MediaPlayerState_MEDIA_PLAYER_STATE_PLAYING)
 	}
 }

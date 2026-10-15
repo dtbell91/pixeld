@@ -15,8 +15,10 @@ Assistant integration (its `pixeld` connection type).
 - **Home Assistant over MQTT** (`px/*` topics): state, playlist, show, content delivered by SHA-256 and
   cached on the light, telemetry, buttons, headphone jack.
 - **Voice satellite** over the ESPHome native API (`:6053`), added by Home Assistant's ESPHome
-  integration: on-device wake word (microWakeWord via an external `mww` binary), speaker, announcements,
-  and timers shown on the panel.
+  integration: on-device wake word (microWakeWord via an external `mww` binary), announcements, and timers
+  shown on the panel. The speaker is a media player too (e.g. for Music Assistant): music streams as
+  48 kHz WAV (Home Assistant converts it), with replies, chimes and alarms mixed over it and the music
+  ducked while the assistant listens or speaks.
 - **DDP** live pixels on UDP 4048 (LedFx, xLights, WLED-style senders), and a Pac-Man game with a phone
   controller page on `:8080`.
 
