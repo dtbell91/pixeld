@@ -11,8 +11,10 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -25,6 +27,9 @@ const (
 	duckDown     = 0.1           // music gain change per block when ducking (fast: ~70 ms to a voice level)
 	duckUp       = 0.04          // ... and coming back (~200 ms)
 	voiceDuck    = 0.3           // music level under a voice sound
+	fadeStep     = 1.0 / 3       // music fade in/out per block (30 ms) on start, pause, resume and stop
+	ampSettle    = 5             // silent blocks between opening the output and the amplifier (and back)
+	fSetPipeSize = 1031          // fcntl F_SETPIPE_SZ
 )
 
 // ErrStopped is passed to a music stream's done callback when it was stopped (not at its end).
@@ -41,6 +46,7 @@ type Speaker struct {
 	gain   float64 // current music duck level (ramps towards the target)
 	voice  *clip
 	music  *stream
+	fading *stream // a stopped or replaced stream fading out
 	wake   chan struct{}
 	device string // ALSA device ("" = the codec)
 }
@@ -54,6 +60,7 @@ type clip struct {
 type stream struct {
 	blocks chan []int16 // decoded music, closed at the end
 	paused bool
+	level  float64 // fade level, 0..1 (moves towards 0 while paused or stopping)
 	cancel context.CancelFunc
 	done   func(error)
 	err    error // set before blocks is closed
@@ -173,13 +180,20 @@ func (s *Speaker) StopMusic() {
 	s.mu.Lock()
 	st := s.music
 	s.music = nil
-	s.mu.Unlock()
-	if st != nil {
-		st.cancel()
-		if st.done != nil {
-			go st.done(ErrStopped)
-		}
+	var drop *stream
+	if st != nil && st.level > 0 { // fade it out (the mixer cancels it once silent)
+		drop, s.fading = s.fading, st
+	} else {
+		drop = st
 	}
+	s.mu.Unlock()
+	if drop != nil {
+		drop.cancel()
+	}
+	if st != nil && st.done != nil {
+		go st.done(ErrStopped)
+	}
+	s.poke()
 }
 
 // MusicActive reports whether music is loaded (playing or paused).
@@ -242,6 +256,14 @@ func (st *stream) decode(ctx context.Context, url string) {
 			if !errors.Is(rerr, io.EOF) && !errors.Is(rerr, io.ErrUnexpectedEOF) && ctx.Err() == nil {
 				st.err = rerr
 			}
+			if len(pending) > 0 { // the last few ms, padded to a block
+				b := make([]int16, blockSamples)
+				copy(b, pending)
+				select {
+				case st.blocks <- b:
+				case <-ctx.Done():
+				}
+			}
 			return
 		}
 	}
@@ -262,7 +284,7 @@ func (s *Speaker) run() {
 func (s *Speaker) active() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.voice != nil || (s.music != nil && !s.music.paused)
+	return s.voice != nil || s.fading != nil || (s.music != nil && (!s.music.paused || s.music.level > 0))
 }
 
 func (s *Speaker) playOut() {
@@ -272,18 +294,36 @@ func (s *Speaker) playOut() {
 	}
 	cmd := exec.Command("aplay", "-q", "-D", dev, "-t", "raw", "-f", "S16_LE", "-r", fmt.Sprint(OutRate), "-c", "1",
 		"--buffer-time=150000")
-	in, err := cmd.StdinPipe()
+	// Our own pipe, kept small: what's written but not yet heard is at most the pipe plus aplay's buffer
+	// (~200 ms), so the silent tail below always plays out a sound's end before the amplifier goes off
+	// (a default 64 KB pipe held 0.7 s and cut the ends of replies), and ducking reacts quickly.
+	r, in, err := os.Pipe()
 	if err == nil {
+		syscall.Syscall(syscall.SYS_FCNTL, in.Fd(), fSetPipeSize, 4096)
+		cmd.Stdin = r
 		err = cmd.Start()
+		r.Close()
 	}
 	if err != nil {
 		log.Printf("voice: aplay: %v", err)
+		if in != nil {
+			in.Close()
+		}
 		s.Stop() // don't leave a sound (and whatever waits for it) hanging
 		time.Sleep(time.Second)
 		return
 	}
-	amp(true)
+	// The amplifier is only on while the output is open and silent at both ends: switching it, or opening
+	// and closing the codec, with the other one live is what pops.
 	out := make([]byte, blockSamples*2)
+	silence := func() {
+		clear(out)
+		for i := 0; i < ampSettle; i++ {
+			in.Write(out)
+		}
+	}
+	silence()
+	amp(true)
 	for idle := 0; idle < idleBlocks; {
 		block, active := s.mix()
 		if active {
@@ -299,16 +339,16 @@ func (s *Speaker) playOut() {
 			break
 		}
 	}
+	amp(false)
+	silence()
 	in.Close()
 	cmd.Wait()
-	if !s.active() {
-		amp(false)
-	} else {
+	if s.active() {
 		s.poke() // something started while closing: open again
 	}
 }
 
-// mix produces the next 10 ms: the voice sound plus the (ducked) music.
+// mix produces the next 10 ms: the voice sound plus the (ducked, faded) music.
 func (s *Speaker) mix() ([]int16, bool) {
 	acc := make([]float64, blockSamples)
 	s.mu.Lock()
@@ -329,29 +369,56 @@ func (s *Speaker) mix() ([]int16, bool) {
 			finished, s.voice = v, nil
 		}
 	}
+	duck0 := s.gain
 	s.gain += math.Max(-duckDown, math.Min(duckUp, target-s.gain))
-	duck := s.gain
-	m := s.music
-	playing := m != nil && !m.paused
+	duck1 := s.gain
+	type part struct {
+		st       *stream
+		from, to float64 // fade level across this block
+		stopping bool
+	}
+	var parts []part
+	for _, st := range []*stream{s.music, s.fading} {
+		if st == nil {
+			continue
+		}
+		stopping := st == s.fading
+		want := 1.0
+		if st.paused || stopping {
+			want = 0
+		}
+		from := st.level
+		st.level += math.Max(-fadeStep, math.Min(fadeStep, want-st.level))
+		if from > 0 || st.level > 0 {
+			parts = append(parts, part{st, from, st.level, stopping})
+		}
+	}
+	if s.fading != nil && s.fading.level == 0 {
+		s.fading.cancel()
+		s.fading = nil
+	}
 	s.mu.Unlock()
 
-	if playing {
+	for _, p := range parts {
 		active = true
 		select {
-		case b, ok := <-m.blocks:
+		case b, ok := <-p.st.blocks:
 			if !ok {
 				s.mu.Lock()
-				if s.music == m {
+				if s.music == p.st {
 					s.music = nil
 				}
 				s.mu.Unlock()
-				if m.done != nil {
-					go m.done(m.err)
+				if !p.stopping && p.st.done != nil {
+					go p.st.done(p.st.err)
 				}
-				break
+				continue
 			}
 			for i, v := range b {
-				acc[i] += float64(v) * duck
+				f := float64(i) / blockSamples
+				level := p.from + (p.to-p.from)*f
+				duck := duck0 + (duck1-duck0)*f
+				acc[i] += float64(v) * level * duck
 			}
 		default: // the stream hasn't caught up: a gap rather than holding up voice sounds
 		}

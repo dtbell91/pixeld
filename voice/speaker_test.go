@@ -87,8 +87,14 @@ func TestMixVoiceOverDuckedMusic(t *testing.T) {
 	}
 	s.music = st
 	out, active := s.mix()
-	if !active || out[0] != 10000 {
-		t.Fatalf("music alone: %d %v", out[0], active)
+	if !active || out[0] != 0 || out[blockSamples-1] < 3000 {
+		t.Fatalf("music doesn't fade in: %d..%d %v", out[0], out[blockSamples-1], active)
+	}
+	for i := 0; i < 3; i++ {
+		out, _ = s.mix()
+	}
+	if out[0] != 10000 {
+		t.Fatalf("music alone: %d", out[0])
 	}
 	done := make(chan struct{})
 	s.PlayPCM(Tone([2]float64{0, 300}), SampleRate, 1, func() { close(done) }) // 300 ms of silence as the voice
@@ -140,18 +146,21 @@ func TestStreamPlaysPausesAndEnds(t *testing.T) {
 		t.Fatal("paused music still playing")
 	}
 	s.PauseMusic(false)
-	got := 0
+	heard, full := 0, 0
 	for i := 0; i < 50; i++ {
 		out, _ := s.mix()
+		if out[blockSamples/2] > 100 {
+			heard++
+		}
 		if math.Abs(float64(out[blockSamples/2])-3000) < 60 {
-			got++
+			full++
 		}
 		if !s.MusicActive() {
 			break
 		}
 	}
-	if got < 9 || got > 11 {
-		t.Fatalf("%d blocks of music for 100 ms", got)
+	if heard != 10 || full < 7 {
+		t.Fatalf("%d blocks of music (%d at full level) for 100 ms", heard, full)
 	}
 	select {
 	case err := <-ended:
@@ -184,5 +193,51 @@ func TestStreamNotWAV(t *testing.T) {
 	}
 	if err := <-ended; err == nil || errors.Is(err, ErrStopped) {
 		t.Fatalf("non-WAV stream: %v", err)
+	}
+}
+
+func TestStopAndPauseFade(t *testing.T) {
+	s := testSpeaker()
+	st := &stream{blocks: make(chan []int16, 200), level: 1, cancel: func() {}}
+	for i := 0; i < 200; i++ {
+		b := make([]int16, blockSamples)
+		for j := range b {
+			b[j] = 10000
+		}
+		st.blocks <- b
+	}
+	cancelled := false
+	st.cancel = func() { cancelled = true }
+	s.music = st
+	s.mix()
+	s.PauseMusic(true)
+	out, active := s.mix()
+	if !active || out[0] < 9000 || out[blockSamples-1] > 7000 {
+		t.Fatalf("pause doesn't fade: %d..%d", out[0], out[blockSamples-1])
+	}
+	for i := 0; i < 3; i++ {
+		s.mix()
+	}
+	held := len(st.blocks)
+	if _, active := s.mix(); active || len(st.blocks) != held {
+		t.Fatal("paused stream still read")
+	}
+	s.PauseMusic(false)
+	for i := 0; i < 3; i++ {
+		s.mix()
+	}
+	s.StopMusic()
+	if s.MusicActive() || cancelled {
+		t.Fatal("stop: still active, or cut off instead of fading")
+	}
+	out, active = s.mix()
+	if !active || out[0] < 9000 || out[blockSamples-1] > 7000 {
+		t.Fatalf("stop doesn't fade: %d..%d", out[0], out[blockSamples-1])
+	}
+	for i := 0; i < 3; i++ {
+		s.mix()
+	}
+	if !cancelled || s.active() {
+		t.Fatal("faded-out stream not dropped")
 	}
 }

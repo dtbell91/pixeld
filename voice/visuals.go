@@ -46,9 +46,21 @@ func (s *Satellite) noticeUntil() time.Time {
 
 // view is what the satellite wants on the panel.
 type view struct {
-	phase  Phase
-	text   string // what was heard (thinking), what's said (speaking), which timer (ringing)
-	notice notice // kind noticeNone: none
+	phase       Phase
+	text        string // what was heard (thinking), what's said (speaking), which timer (ringing)
+	notice      notice // kind noticeNone: none
+	afterSpeech bool   // the reply's text staying up after the speech, until it has been read
+}
+
+func (v view) idle() bool { return v.phase == Idle && v.notice.kind == noticeNone }
+
+// readTime is how long the reply text needs on the panel: one full pass of the scroll (or 2 s if it fits).
+func readTime(text string) time.Duration {
+	w := cards.TextWidth(text, 1)
+	if w <= panel.Size {
+		return 2 * time.Second
+	}
+	return time.Duration((0.8 + float64(w+2)/scrollSpeed) * float64(time.Second))
 }
 
 func (s *Satellite) view(now time.Time) view {
@@ -75,25 +87,48 @@ func (s *Satellite) view(now time.Time) view {
 func Show(ctx context.Context, s *Satellite, show func(*panel.Frame), done func()) {
 	t := time.NewTicker(50 * time.Millisecond)
 	defer t.Stop()
-	var since time.Time
+	var since, lingerUntil time.Time
 	var last view
+	var linger *view // the reply text, kept up after the speech ends until it has been read
+	drawing := false
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case now := <-t.C:
 			v := s.view(now)
-			if v.phase != last.phase || v.notice != last.notice || v.text != last.text {
-				since = now
-				if v.phase == Idle && v.notice.kind == noticeNone {
-					done()
+			if v != last {
+				if last.phase == Speaking && last.text != "" && v.idle() {
+					if until := since.Add(readTime(last.text)); now.Before(until) {
+						l := last
+						l.afterSpeech = true
+						linger, lingerUntil = &l, until // since stays: the text carries on where it was
+					}
 				}
+				if !v.idle() {
+					linger = nil
+				}
+				if linger == nil {
+					since = now
+				}
+				last = v
 			}
-			last = v
-			if v.phase == Idle && v.notice.kind == noticeNone {
-				continue
+			cur := v
+			if v.idle() {
+				if linger == nil || !now.Before(lingerUntil) {
+					linger = nil
+					if drawing {
+						drawing = false
+						s.visualsBusy.Store(false)
+						done()
+					}
+					continue
+				}
+				cur = *linger
 			}
-			show(frame(v, now.Sub(since).Seconds()))
+			drawing = true
+			s.visualsBusy.Store(true)
+			show(frame(cur, now.Sub(since).Seconds()))
 		}
 	}
 }
@@ -119,6 +154,10 @@ func frame(v view, t float64) *panel.Frame {
 			scrollText(f, v.text, 27, t, cards.RGB{150, 110, 220})
 		}
 	case Speaking: // bars like a level meter; with the reply scrolling through the middle
+		if v.afterSpeech {
+			scrollText(f, v.text, 13, t, cards.RGB{230, 240, 235})
+			break
+		}
 		if v.text == "" {
 			meter(f, t, 16, 13)
 			break

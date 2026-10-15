@@ -136,7 +136,7 @@ func (s *Satellite) DrawTimers(f *panel.Frame, now time.Time, quiet bool) (bool,
 	if len(s.timers) == 0 {
 		return false, time.Time{}
 	}
-	if s.phase != Idle || s.noticeActive(now) {
+	if s.phase != Idle || s.noticeActive(now) || s.visualsBusy.Load() {
 		return false, s.noticeUntil() // look again once a notice ends (a phase change refreshes anyway)
 	}
 	if t := s.timers[s.timerFocus]; t != nil && now.Before(s.timerFocusUntil) {

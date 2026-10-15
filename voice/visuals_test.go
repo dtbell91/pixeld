@@ -1,11 +1,13 @@
 package voice
 
 import (
+	"context"
 	"image"
 	"image/color"
 	"image/png"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -213,5 +215,48 @@ func TestPreviewSheet(t *testing.T) {
 	defer w.Close()
 	if err := png.Encode(w, img); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestReplyTextStaysUntilRead(t *testing.T) {
+	s := newTestSat()
+	s.phase, s.reply = Speaking, "OK"
+	var mu sync.Mutex
+	var lastFrame time.Time
+	doneAt := make(chan time.Time, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go Show(ctx, s, func(*panel.Frame) {
+		mu.Lock()
+		lastFrame = time.Now()
+		mu.Unlock()
+	}, func() { doneAt <- time.Now() })
+	start := time.Now()
+	time.Sleep(300 * time.Millisecond)
+	s.mu.Lock()
+	s.phase = Idle // the speech ended early
+	s.mu.Unlock()
+	if !s.visualsBusy.Load() {
+		t.Fatal("not marked busy while showing")
+	}
+	select {
+	case at := <-doneAt:
+		if held := at.Sub(start); held < readTime("OK")-100*time.Millisecond {
+			t.Fatalf("text gone after %v, want ~%v", held, readTime("OK"))
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("never handed the panel back")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if lastFrame.Sub(start) < time.Second {
+		t.Fatal("no frames after the speech ended")
+	}
+	if s.visualsBusy.Load() {
+		t.Fatal("still busy after done")
+	}
+	long := "THE WEATHER TODAY IS SUNNY WITH A HIGH OF 24"
+	if r := readTime(long); r < 8*time.Second {
+		t.Fatalf("readTime(long) = %v", r)
 	}
 }

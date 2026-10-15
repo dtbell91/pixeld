@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -91,7 +92,8 @@ type Satellite struct {
 	heard, reply    string // what was understood / is being said back (or announced)
 	notice          notice
 	timers          map[string]*voiceTimer
-	timerFocus      string // the timer just set or changed: full screen until timerFocusUntil
+	visualsBusy     atomic.Bool // Show is drawing (the timer overlay steps aside)
+	timerFocus      string      // the timer just set or changed: full screen until timerFocusUntil
 	timerFocusUntil time.Time
 }
 
