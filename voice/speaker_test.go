@@ -86,12 +86,12 @@ func TestMixVoiceOverDuckedMusic(t *testing.T) {
 		st.blocks <- b
 	}
 	s.music = st
-	out, active := s.mix()
+	out, active := s.mix(time.Time{})
 	if !active || out[0] != 0 || out[blockSamples-1] < 3000 {
 		t.Fatalf("music doesn't fade in: %d..%d %v", out[0], out[blockSamples-1], active)
 	}
 	for i := 0; i < 3; i++ {
-		out, _ = s.mix()
+		out, _ = s.mix(time.Time{})
 	}
 	if out[0] != 10000 {
 		t.Fatalf("music alone: %d", out[0])
@@ -99,13 +99,13 @@ func TestMixVoiceOverDuckedMusic(t *testing.T) {
 	done := make(chan struct{})
 	s.PlayPCM(Tone([2]float64{0, 300}), SampleRate, 1, func() { close(done) }) // 300 ms of silence as the voice
 	for i := 0; i < 15; i++ {
-		out, _ = s.mix()
+		out, _ = s.mix(time.Time{})
 	}
 	if want := int16(10000 * voiceDuck); math.Abs(float64(out[0]-want)) > 50 {
 		t.Fatalf("music under a voice sound: %d, want ~%d", out[0], want)
 	}
 	for i := 0; i < 40; i++ {
-		out, _ = s.mix()
+		out, _ = s.mix(time.Time{})
 	}
 	select {
 	case <-done:
@@ -117,7 +117,7 @@ func TestMixVoiceOverDuckedMusic(t *testing.T) {
 	}
 	s.SetDuck(0.1)
 	for i := 0; i < 30; i++ {
-		out, _ = s.mix()
+		out, _ = s.mix(time.Time{})
 	}
 	if math.Abs(float64(out[0])-1000) > 50 {
 		t.Fatalf("music while listening: %d, want ~1000", out[0])
@@ -125,7 +125,7 @@ func TestMixVoiceOverDuckedMusic(t *testing.T) {
 	s.SetVolume(0.5)
 	s.SetDuck(1)
 	for i := 0; i < 30; i++ {
-		out, _ = s.mix()
+		out, _ = s.mix(time.Time{})
 	}
 	if math.Abs(float64(out[0])-2500) > 50 { // gain = volume²
 		t.Fatalf("at half volume: %d, want ~2500", out[0])
@@ -142,13 +142,13 @@ func TestStreamPlaysPausesAndEnds(t *testing.T) {
 	s.PlayStream(srv.URL, func(err error) { ended <- err })
 	time.Sleep(200 * time.Millisecond) // let it fetch and decode
 	s.PauseMusic(true)
-	if _, active := s.mix(); active {
+	if _, active := s.mix(time.Time{}); active {
 		t.Fatal("paused music still playing")
 	}
 	s.PauseMusic(false)
 	heard, full := 0, 0
 	for i := 0; i < 50; i++ {
-		out, _ := s.mix()
+		out, _ := s.mix(time.Time{})
 		if out[blockSamples/2] > 100 {
 			heard++
 		}
@@ -188,7 +188,7 @@ func TestStreamNotWAV(t *testing.T) {
 	s.PlayStream(srv.URL, func(err error) { ended <- err })
 	deadline := time.Now().Add(time.Second)
 	for s.MusicActive() && time.Now().Before(deadline) {
-		s.mix()
+		s.mix(time.Time{})
 		time.Sleep(5 * time.Millisecond)
 	}
 	if err := <-ended; err == nil || errors.Is(err, ErrStopped) {
@@ -209,33 +209,33 @@ func TestStopAndPauseFade(t *testing.T) {
 	cancelled := false
 	st.cancel = func() { cancelled = true }
 	s.music = st
-	s.mix()
+	s.mix(time.Time{})
 	s.PauseMusic(true)
-	out, active := s.mix()
+	out, active := s.mix(time.Time{})
 	if !active || out[0] < 9000 || out[blockSamples-1] > 7000 {
 		t.Fatalf("pause doesn't fade: %d..%d", out[0], out[blockSamples-1])
 	}
 	for i := 0; i < 3; i++ {
-		s.mix()
+		s.mix(time.Time{})
 	}
 	held := len(st.blocks)
-	if _, active := s.mix(); active || len(st.blocks) != held {
+	if _, active := s.mix(time.Time{}); active || len(st.blocks) != held {
 		t.Fatal("paused stream still read")
 	}
 	s.PauseMusic(false)
 	for i := 0; i < 3; i++ {
-		s.mix()
+		s.mix(time.Time{})
 	}
 	s.StopMusic()
 	if s.MusicActive() || cancelled {
 		t.Fatal("stop: still active, or cut off instead of fading")
 	}
-	out, active = s.mix()
+	out, active = s.mix(time.Time{})
 	if !active || out[0] < 9000 || out[blockSamples-1] > 7000 {
 		t.Fatalf("stop doesn't fade: %d..%d", out[0], out[blockSamples-1])
 	}
 	for i := 0; i < 3; i++ {
-		s.mix()
+		s.mix(time.Time{})
 	}
 	if !cancelled || s.active() {
 		t.Fatal("faded-out stream not dropped")
@@ -261,7 +261,7 @@ func TestVoiceStreamStartsBeforeDownloadEnds(t *testing.T) {
 	var firstSound time.Duration
 	heard := 0
 	for i := 0; i < 400; i++ {
-		out, active := s.mix()
+		out, active := s.mix(time.Time{})
 		if !active {
 			break
 		}
@@ -283,5 +283,23 @@ func TestVoiceStreamStartsBeforeDownloadEnds(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("done not called")
+	}
+}
+
+func TestOutClockIgnoresLateWakeups(t *testing.T) {
+	var c outClock
+	t0 := time.Now()
+	for i := 0; i < 300; i++ {
+		late := time.Duration(0)
+		if i%7 == 3 {
+			late = 3 * time.Millisecond // woken late: the delay reads the same (it moves in whole periods)
+		}
+		c.observe(t0.Add(time.Duration(i)*10*time.Millisecond+late), 2880)
+		c.written += 480
+	}
+	// frame 0 is heard 60 ms after the first write; the next frame (300 blocks in) 3 s after that
+	want := t0.Add(60*time.Millisecond + 3*time.Second)
+	if d := c.next().Sub(want); d < -50*time.Microsecond || d > 50*time.Microsecond {
+		t.Fatalf("next is %v off", d)
 	}
 }

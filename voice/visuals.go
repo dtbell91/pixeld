@@ -21,6 +21,7 @@ const (
 	noticeNone   noticeKind = iota
 	noticeVolume            // speaker volume (level) or mute (!on)
 	noticeMic               // microphone on / off (privacy)
+	noticeCode              // a music server's pairing code (text), up until pairing ends
 )
 
 // notice is a brief on-panel confirmation of a setting change.
@@ -29,6 +30,7 @@ type notice struct {
 	level float64
 	on    bool
 	at    time.Time
+	text  string
 }
 
 // noticeActive (s.mu held) reports whether a notice is on the panel at now.
@@ -77,6 +79,8 @@ func (s *Satellite) view(now time.Time) view {
 	}
 	if s.noticeActive(now) {
 		v.notice = s.notice
+	} else if s.pairingCode != "" && s.phase == Idle {
+		v.notice = notice{kind: noticeCode, text: s.pairingCode}
 	}
 	return v
 }
@@ -224,6 +228,12 @@ func drawNotice(f *panel.Frame, n notice) {
 		}
 		cards.Text(f, "MIC", (panel.Size-cards.TextWidth("MIC", 2))/2, 4, 2, c)
 		cards.Text(f, word, (panel.Size-cards.TextWidth(word, 2))/2, 18, 2, c)
+	case noticeCode: // 123 over 456, as the spec groups it
+		c := cards.RGB{0, 200, 255}
+		if len(n.text) == 6 {
+			cards.Text(f, n.text[:3], (panel.Size-cards.TextWidth(n.text[:3], 2))/2, 4, 2, c)
+			cards.Text(f, n.text[3:], (panel.Size-cards.TextWidth(n.text[3:], 2))/2, 18, 2, c)
+		}
 	}
 }
 

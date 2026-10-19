@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -28,6 +29,7 @@ import (
 	"pixeld/panel"
 	"pixeld/player"
 	"pixeld/selfupdate"
+	"pixeld/sendspin"
 	"pixeld/voice"
 )
 
@@ -316,7 +318,7 @@ func (a *app) idleLED(st player.Status) {
 	}
 }
 
-func (a *app) startVoice(ctx context.Context, addr string) *voice.Satellite {
+func (a *app) startVoice(ctx context.Context, addr, sendspinAddr string) *voice.Satellite {
 	// In the image: /usr/bin/mww + /usr/share/mww; for development also /mnt/UDISK/voice/{mww,models}.
 	mww, models := "/usr/bin/mww", "/usr/share/mww"
 	if _, err := os.Stat(mww); err != nil {
@@ -362,6 +364,9 @@ func (a *app) startVoice(ctx context.Context, addr string) *voice.Satellite {
 	a.mu.Unlock()
 	a.sat.Store(sat)
 	a.player.SetOverlay(sat.DrawTimers)
+	if sendspinAddr != "" {
+		startSendspin(ctx, sat, a.path("sendspin.json"), sendspinAddr, strings.ToLower(mac))
+	}
 	go sat.Run(ctx)
 	go voice.Show(ctx, sat, a.player.Stream, a.player.EndStream)
 	go func() {
@@ -371,6 +376,37 @@ func (a *app) startVoice(ctx context.Context, addr string) *voice.Satellite {
 	}()
 	go advertise(ctx, sat.Name, addr, strings.ToLower(mac))
 	return sat
+}
+
+// startSendspin makes the speaker a Sendspin player too (Music Assistant's synchronised playback): the
+// same speaker, volume and mute as the voice satellite's media player.
+func startSendspin(ctx context.Context, sat *voice.Satellite, statePath, addr, mac string) {
+	var ss *sendspin.Client
+	ss, err := sendspin.New(sendspin.Config{
+		StatePath: statePath, Name: sat.FriendlyName, Product: "H8630 Gaming Pixel Light",
+		Manufacturer: "Govee (custom firmware)", Version: version, MAC: mac,
+		Volume: func() (int, bool) {
+			v, m := sat.Speaker()
+			return int(math.Round(v * 100)), m
+		},
+		SetVolume:     func(v int) { sat.SetVolume(float64(v) / 100) },
+		SetMuted:      sat.SetMuted,
+		OnPairingCode: sat.ShowPairingCode,
+		OnPlaying:     sat.SyncedMusic,
+	})
+	if err != nil {
+		log.Printf("sendspin: %v", err)
+		return
+	}
+	sat.SetTimed(ss.Player())
+	sat.OnSpeaker = ss.StateChanged
+	sat.OnMusic = ss.Leave
+	go func() {
+		if err := ss.Serve(ctx, addr); err != nil {
+			log.Printf("sendspin: %v", err)
+		}
+	}()
+	go advertiseSendspin(ctx, sat.FriendlyName, addr)
 }
 
 func readFileString(p string) string {
@@ -437,7 +473,7 @@ func run(ctx context.Context, cfg config) error {
 	go a.player.Run(ctx, func(err error) { log.Printf("draw: %v", err) })
 	var sat *voice.Satellite
 	if cfg.voice != "" && !cfg.sim {
-		sat = a.startVoice(ctx, cfg.voice)
+		sat = a.startVoice(ctx, cfg.voice, cfg.sendspin)
 	}
 	if cfg.game != "" && !cfg.sim {
 		go game.NewServer(a.player.Stream).ListenAndServe(cfg.game)

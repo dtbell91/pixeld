@@ -11,10 +11,7 @@ import (
 	"math"
 	"net"
 	"net/http"
-	"os"
-	"os/exec"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -29,8 +26,7 @@ const (
 	duckUp       = 0.04          // ... and coming back (~200 ms)
 	voiceDuck    = 0.3           // music level under a voice sound
 	fadeStep     = 1.0 / 3       // music fade in/out per block (30 ms) on start, pause, resume and stop
-	ampSettle    = 5             // silent blocks between opening the output and the amplifier (and back)
-	fSetPipeSize = 1031          // fcntl F_SETPIPE_SZ
+	outPeriods   = 6             // output buffer: 6 blocks (60 ms)
 )
 
 // ErrStopped is passed to a music stream's done callback when it was stopped (not at its end).
@@ -47,9 +43,15 @@ type Speaker struct {
 	gain   float64 // current music duck level (ramps towards the target)
 	voice  *clip
 	music  *stream
-	fading *stream // a stopped or replaced stream fading out
+	fading *stream     // a stopped or replaced stream fading out
+	timed  TimedSource // synchronised music (Sendspin), mixed like music
 	wake   chan struct{}
-	device string // ALSA device ("" = the codec)
+}
+
+// TimedSource is music that has to be heard at given times (synchronised playback): Fill writes the
+// samples due from at onward (mono, OutRate) into dst and reports whether there were any.
+type TimedSource interface {
+	Fill(dst []int16, at time.Time) bool
 }
 
 type clip struct {
@@ -174,6 +176,14 @@ func (s *Speaker) Playing() bool {
 }
 
 // ---- music ----
+
+// SetTimed sets (nil: removes) the synchronised music source, played (ducked like music) whenever it has
+// samples due.
+func (s *Speaker) SetTimed(t TimedSource) {
+	s.mu.Lock()
+	s.timed = t
+	s.mu.Unlock()
+}
 
 var streamClient = &http.Client{Transport: &http.Transport{ // no overall timeout: music streams run for hours
 	DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
@@ -305,12 +315,11 @@ func (st *stream) decode(ctx context.Context, url string) {
 
 // ---- output ----
 
-// run keeps the output open while there is something to play, mixing 10 ms at a time.
 // run keeps the output open all the time (silence when there's nothing to play), so a sound starts
-// without waiting for aplay and the codec to start; only the amplifier is switched, around sounds.
+// without waiting for the codec to start; only the amplifier is switched, around sounds.
 func (s *Speaker) run() {
 	for {
-		s.playOut() // returns only if aplay fails
+		s.playOut() // returns only if the output fails
 		time.Sleep(time.Second)
 	}
 }
@@ -322,39 +331,26 @@ func (s *Speaker) active() bool {
 }
 
 func (s *Speaker) playOut() {
-	dev := s.device
-	if dev == "" {
-		dev = "plughw:0,0"
-	}
-	cmd := exec.Command("aplay", "-q", "-D", dev, "-t", "raw", "-f", "S16_LE", "-r", fmt.Sprint(OutRate), "-c", "1",
-		"--buffer-time=60000", "--period-time=10000")
-	// Our own pipe, kept small: what's written but not yet heard is at most the pipe plus aplay's buffer
-	// (~100 ms). That's the delay before any sound and how fast ducking reacts, and the amplifier stays on
-	// long enough after a sound (idleBlocks) for its end to play out.
-	r, in, err := os.Pipe()
-	if err == nil {
-		syscall.Syscall(syscall.SYS_FCNTL, in.Fd(), fSetPipeSize, 4096)
-		cmd.Stdin = r
-		err = cmd.Start()
-		r.Close()
-	}
+	// What's written but not yet heard is at most the buffer (60 ms): the delay before any sound and how
+	// fast ducking reacts; the amplifier stays on long enough after a sound (idleBlocks) for its end to
+	// play out.
+	o, err := openPCM(OutRate, blockSamples, outPeriods)
 	if err != nil {
-		log.Printf("voice: aplay: %v", err)
-		if in != nil {
-			in.Close()
-		}
+		log.Printf("voice: audio output: %v", err)
 		s.Stop() // don't leave a sound (and whatever waits for it) hanging
 		return
 	}
-	defer cmd.Wait()
-	defer in.Close()
+	defer o.Close()
 	// The amplifier is switched only while the output plays silence (switching it with sound going, or
 	// opening and closing the codec with it on, is what pops): it goes on as a sound is written, still
-	// ~100 ms ahead of it being heard, and off once idleBlocks of silence have followed the last sound.
-	out := make([]byte, blockSamples*2)
+	// ~60 ms ahead of it being heard, and off once idleBlocks of silence have followed the last sound.
+	var clk outClock
 	ampOn, idle := false, 0
 	for {
-		block, active := s.mix()
+		if d, err := o.Delay(); err == nil {
+			clk.observe(time.Now(), d)
+		}
+		block, active := s.mix(clk.next())
 		switch {
 		case active:
 			idle = 0
@@ -368,21 +364,57 @@ func (s *Speaker) playOut() {
 				ampOn = false
 			}
 		}
-		for i, v := range block {
-			binary.LittleEndian.PutUint16(out[i*2:], uint16(v))
-		}
-		if _, err := in.Write(out); err != nil {
-			log.Printf("voice: aplay: %v", err)
+		underrun, err := o.Write(block)
+		if err != nil {
+			log.Printf("voice: audio output: %v", err)
 			if ampOn {
 				amp(false)
 			}
 			return
 		}
+		if underrun {
+			log.Printf("voice: audio output underrun")
+			clk = outClock{} // the stream restarted: a new timeline
+		}
+		clk.written += int64(len(block))
 	}
 }
 
-// mix produces the next 10 ms: the voice sound plus the (ducked, faded) music.
-func (s *Speaker) mix() ([]int16, bool) {
+// outClock estimates when each sample written to the output will be heard: when a write returns there
+// are Delay frames ahead of the next one, so frame 0 was (or will be) heard at now + delay - written. A
+// late wakeup only makes that estimate later, so the timeline is the earliest estimate over the last
+// couple of seconds (the audio and system clocks drift apart by well under 1 ppm).
+type outClock struct {
+	written int64      // frames written since the stream started
+	est     [200]int64 // recent estimates of frame 0's time (ns since base)
+	n       int
+	base    time.Time
+}
+
+func (c *outClock) observe(now time.Time, delay int) {
+	if c.base.IsZero() {
+		c.base = now
+	}
+	e := now.Sub(c.base).Nanoseconds() + int64(delay-int(c.written))*1e9/OutRate
+	c.est[c.n%len(c.est)] = e
+	c.n++
+}
+
+// next is when the next frame written will be heard (zero before any observation).
+func (c *outClock) next() time.Time {
+	if c.n == 0 {
+		return time.Time{}
+	}
+	m := c.est[0]
+	for _, e := range c.est[1:min(c.n, len(c.est))] {
+		m = min(m, e)
+	}
+	return c.base.Add(time.Duration(m + c.written*1e9/OutRate))
+}
+
+// mix produces the next 10 ms, to be heard from at: the voice sound plus the (ducked, faded) music, or
+// the synchronised music (Sendspin).
+func (s *Speaker) mix(at time.Time) ([]int16, bool) {
 	acc := make([]float64, blockSamples)
 	s.mu.Lock()
 	gain := s.volume * s.volume // perceptual-ish curve
@@ -439,7 +471,18 @@ func (s *Speaker) mix() ([]int16, bool) {
 		s.fading.cancel()
 		s.fading = nil
 	}
+	timed := s.timed
 	s.mu.Unlock()
+
+	if timed != nil && !at.IsZero() {
+		b := make([]int16, blockSamples)
+		if timed.Fill(b, at) {
+			active = true
+			for i, v := range b {
+				acc[i] += float64(v) * (duck0 + (duck1-duck0)*float64(i)/blockSamples)
+			}
+		}
+	}
 
 	for _, p := range parts {
 		active = true

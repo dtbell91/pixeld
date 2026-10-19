@@ -66,10 +66,13 @@ type Satellite struct {
 	ConfigPath                       string
 	OnPhase                          func(Phase) // panel / LED feedback
 	OnTimers                         func()      // the running timers changed (redraw the overlay)
+	OnSpeaker                        func()      // the speaker's volume or mute changed
+	OnMusic                          func()      // Home Assistant started music on the media player
 
 	models   map[string]WakeModel
 	detector *Detector
 	speaker  *Speaker
+	timed    TimedSource // synchronised music (Sendspin), set before Run
 
 	mu           sync.Mutex
 	conn         *api.Conn
@@ -97,6 +100,7 @@ type Satellite struct {
 	visualsBusy     atomic.Bool // Show is drawing (the timer overlay steps aside)
 	timerFocus      string      // the timer just set or changed: full screen until timerFocusUntil
 	timerFocusUntil time.Time
+	pairingCode     string // shown while a music server pairs with the light
 }
 
 func NewSatellite(modelDir, mwwBin string) *Satellite {
@@ -130,6 +134,9 @@ func (s *Satellite) Run(ctx context.Context) {
 	s.loadConfig()
 	s.speaker = NewSpeaker(s.cfg.Volume)
 	s.speaker.SetMuted(s.cfg.SpeakerMuted)
+	if s.timed != nil {
+		s.speaker.SetTimed(s.timed)
+	}
 	s.detector.SetActive(s.cfg.ActiveWakeWords)
 	Capture(ctx, s.onAudio)
 }
@@ -615,25 +622,72 @@ func (s *Satellite) mediaCommand(req *api.MediaPlayerCommandRequest) {
 			s.setVolume(v - 0.1)
 		}
 	case api.MediaPlayerCommand_MEDIA_PLAYER_COMMAND_MUTE, api.MediaPlayerCommand_MEDIA_PLAYER_COMMAND_UNMUTE:
-		s.mu.Lock()
-		s.cfg.SpeakerMuted = req.Command == api.MediaPlayerCommand_MEDIA_PLAYER_COMMAND_MUTE
-		s.saveConfig()
-		s.notice = notice{kind: noticeVolume, level: s.cfg.Volume, on: !s.cfg.SpeakerMuted, at: time.Now()}
-		s.mu.Unlock()
-		s.speaker.SetMuted(s.cfg.SpeakerMuted)
-		s.sendMediaState()
+		s.SetMuted(req.Command == api.MediaPlayerCommand_MEDIA_PLAYER_COMMAND_MUTE)
 	}
 }
+
+// SetVolume sets the speaker volume (0..1), from Home Assistant or a music server.
+func (s *Satellite) SetVolume(v float64) { s.setVolume(v) }
 
 func (s *Satellite) setVolume(v float64) {
 	v = math.Max(0, math.Min(1, v))
 	s.mu.Lock()
+	changed := v != s.cfg.Volume
 	s.cfg.Volume = v
 	s.saveConfig()
 	s.notice = notice{kind: noticeVolume, level: v, on: !s.cfg.SpeakerMuted, at: time.Now()}
 	s.mu.Unlock()
 	s.speaker.SetVolume(v)
 	s.sendMediaState()
+	if changed && s.OnSpeaker != nil {
+		s.OnSpeaker()
+	}
+}
+
+// SetMuted mutes or unmutes the speaker.
+func (s *Satellite) SetMuted(m bool) {
+	s.mu.Lock()
+	changed := m != s.cfg.SpeakerMuted
+	s.cfg.SpeakerMuted = m
+	s.saveConfig()
+	s.notice = notice{kind: noticeVolume, level: s.cfg.Volume, on: !m, at: time.Now()}
+	s.mu.Unlock()
+	s.speaker.SetMuted(m)
+	s.sendMediaState()
+	if changed && s.OnSpeaker != nil {
+		s.OnSpeaker()
+	}
+}
+
+// Speaker reports the speaker's volume (0..1) and mute.
+func (s *Satellite) Speaker() (float64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cfg.Volume, s.cfg.SpeakerMuted
+}
+
+// SetTimed sets the synchronised music source (Sendspin); call before Run.
+func (s *Satellite) SetTimed(t TimedSource) { s.timed = t }
+
+// SyncedMusic is told when synchronised music starts or stops: it takes over from Home Assistant's own
+// music (one speaker, one music at a time).
+func (s *Satellite) SyncedMusic(playing bool) {
+	if !playing || s.speaker == nil || !s.speaker.MusicActive() {
+		return
+	}
+	s.mu.Lock()
+	s.queue = nil
+	s.musicGen++
+	s.mu.Unlock()
+	s.speaker.StopMusic()
+	s.setMusicState(api.MediaPlayerState_MEDIA_PLAYER_STATE_IDLE)
+}
+
+// ShowPairingCode shows a music server's pairing code on the panel ("" takes it down).
+func (s *Satellite) ShowPairingCode(code string) {
+	s.mu.Lock()
+	s.pairingCode = code
+	s.mu.Unlock()
 }
 
 // playMusic streams url (Home Assistant converts it to the WAV format we asked for), then whatever was
@@ -644,6 +698,9 @@ func (s *Satellite) playMusic(url string) {
 	gen := s.musicGen
 	s.mu.Unlock()
 	log.Printf("voice: playing music")
+	if s.OnMusic != nil {
+		s.OnMusic()
+	}
 	s.setMusicState(api.MediaPlayerState_MEDIA_PLAYER_STATE_PLAYING)
 	s.speaker.PlayStream(url, func(err error) {
 		if errors.Is(err, ErrStopped) {

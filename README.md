@@ -19,6 +19,11 @@ Assistant integration (its `pixeld` connection type).
   shown on the panel. The speaker is a media player too (e.g. for Music Assistant): music streams as
   48 kHz WAV (Home Assistant converts it), with replies, chimes and alarms mixed over it and the music
   ducked while the assistant listens or speaks.
+- **Sendspin player** (`:8928/sendspin`, advertised as `_sendspin._tcp`): Music Assistant's synchronised
+  multi-room protocol, so the light can be grouped with other Sendspin speakers. End-to-end encrypted
+  (Noise KKpsk2); paired by a 6-digit code shown on the panel, or by token (`pixeld -sendspin-token`).
+  Audio is scheduled against the server's clock straight through ALSA (no `aplay`), so the light knows
+  to the sample when each block is heard. Same speaker, volume and mute as the media player.
 - **DDP** live pixels on UDP 4048 (LedFx, xLights, WLED-style senders), and a Pac-Man game with a phone
   controller page on `:8080`.
 

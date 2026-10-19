@@ -35,8 +35,11 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
+
+	"pixeld/sendspin"
 )
 
 var version = "dev"
@@ -49,6 +52,7 @@ type config struct {
 	ddp                            string
 	game                           string
 	voice                          string
+	sendspin                       string
 }
 
 func readEnv(path string) map[string]string {
@@ -77,10 +81,20 @@ func main() {
 	ddpAddr := flag.String("ddp", ":4048", "DDP (UDP) listen address for live frames; empty to disable")
 	gameAddr := flag.String("game", ":8080", "Pac-Man controller page (HTTP); empty to disable")
 	voiceAddr := flag.String("voice", ":6053", "voice satellite (ESPHome API); empty to disable")
+	sendspinAddr := flag.String("sendspin", ":8928", "Sendspin player (Music Assistant), with the voice satellite; empty to disable")
 	showVersion := flag.Bool("version", false, "print the version and exit")
+	showToken := flag.Bool("sendspin-token", false, "print the Sendspin pairing token (for pairing by token) and exit")
 	flag.Parse()
 	if *showVersion {
 		fmt.Println(version)
+		return
+	}
+	if *showToken {
+		t, err := sendspin.Token(filepath.Join(*data, "sendspin.json"))
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println(t)
 		return
 	}
 
@@ -91,7 +105,8 @@ func main() {
 		}
 	}
 	cfg := config{host: env["MQTT_HOST"], port: env["MQTT_PORT"], user: env["MQTT_USER"], pass: env["MQTT_PASS"],
-		prefix: env["MQTT_PREFIX"], dataDir: *data, sim: *sim, preview: *preview, ddp: *ddpAddr, game: *gameAddr, voice: *voiceAddr}
+		prefix: env["MQTT_PREFIX"], dataDir: *data, sim: *sim, preview: *preview, ddp: *ddpAddr, game: *gameAddr, voice: *voiceAddr,
+		sendspin: *sendspinAddr}
 	if *prefix != "" {
 		cfg.prefix = *prefix
 	}
