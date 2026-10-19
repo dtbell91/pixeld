@@ -24,6 +24,11 @@ Assistant integration (its `pixeld` connection type).
   (Noise KKpsk2); paired by a 6-digit code shown on the panel, or by token (`pixeld -sendspin-token`).
   Audio is scheduled against the server's clock straight through ALSA (no `aplay`), so the light knows
   to the sample when each block is heard. Same speaker, volume and mute as the media player.
+- **Bluetooth proxy** for Home Assistant over the same ESPHome API connection: passive BLE scanning
+  through a raw HCI socket on the RTL8723DS (pixeld powers it on via rfkill and attaches it with
+  `rtk_hciattach`; no BlueZ daemon), advertisements relayed raw in batches, as ESPHome proxies do.
+  Scans only while Home Assistant is subscribed, 30 ms in every 320 ms to leave the radio to WiFi.
+  `-bluetooth=false` turns it off.
 - **DDP** live pixels on UDP 4048 (LedFx, xLights, WLED-style senders), and a Pac-Man game with a phone
   controller page on `:8080`.
 

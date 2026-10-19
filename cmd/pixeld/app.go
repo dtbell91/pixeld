@@ -20,6 +20,7 @@ import (
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 
+	"pixeld/bt"
 	"pixeld/cards"
 	"pixeld/content"
 	"pixeld/ddp"
@@ -318,7 +319,7 @@ func (a *app) idleLED(st player.Status) {
 	}
 }
 
-func (a *app) startVoice(ctx context.Context, addr, sendspinAddr string) *voice.Satellite {
+func (a *app) startVoice(ctx context.Context, addr, sendspinAddr string, btProxy bool) *voice.Satellite {
 	// In the image: /usr/bin/mww + /usr/share/mww; for development also /mnt/UDISK/voice/{mww,models}.
 	mww, models := "/usr/bin/mww", "/usr/share/mww"
 	if _, err := os.Stat(mww); err != nil {
@@ -369,6 +370,16 @@ func (a *app) startVoice(ctx context.Context, addr, sendspinAddr string) *voice.
 	}
 	go sat.Run(ctx)
 	go voice.Show(ctx, sat, a.player.Stream, a.player.EndStream)
+	if btProxy {
+		go func() {
+			p, err := bt.Start(ctx)
+			if err != nil {
+				log.Printf("bluetooth: %v", err)
+				return
+			}
+			sat.SetBluetooth(p)
+		}()
+	}
 	go func() {
 		if err := (&esphomeapi.Server{Name: sat.Name, Handler: sat}).ListenAndServe(addr); err != nil {
 			log.Printf("voice: %v", err)
@@ -473,7 +484,7 @@ func run(ctx context.Context, cfg config) error {
 	go a.player.Run(ctx, func(err error) { log.Printf("draw: %v", err) })
 	var sat *voice.Satellite
 	if cfg.voice != "" && !cfg.sim {
-		sat = a.startVoice(ctx, cfg.voice, cfg.sendspin)
+		sat = a.startVoice(ctx, cfg.voice, cfg.sendspin, cfg.bluetooth)
 	}
 	if cfg.game != "" && !cfg.sim {
 		go game.NewServer(a.player.Stream).ListenAndServe(cfg.game)

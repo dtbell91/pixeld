@@ -53,6 +53,7 @@ type config struct {
 	game                           string
 	voice                          string
 	sendspin                       string
+	bluetooth                      bool
 }
 
 func readEnv(path string) map[string]string {
@@ -82,6 +83,7 @@ func main() {
 	gameAddr := flag.String("game", ":8080", "Pac-Man controller page (HTTP); empty to disable")
 	voiceAddr := flag.String("voice", ":6053", "voice satellite (ESPHome API); empty to disable")
 	sendspinAddr := flag.String("sendspin", ":8928", "Sendspin player (Music Assistant), with the voice satellite; empty to disable")
+	btProxy := flag.Bool("bluetooth", true, "Bluetooth proxy for Home Assistant (with the voice satellite)")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	showToken := flag.Bool("sendspin-token", false, "print the Sendspin pairing token (for pairing by token) and exit")
 	flag.Parse()
@@ -106,7 +108,7 @@ func main() {
 	}
 	cfg := config{host: env["MQTT_HOST"], port: env["MQTT_PORT"], user: env["MQTT_USER"], pass: env["MQTT_PASS"],
 		prefix: env["MQTT_PREFIX"], dataDir: *data, sim: *sim, preview: *preview, ddp: *ddpAddr, game: *gameAddr, voice: *voiceAddr,
-		sendspin: *sendspinAddr}
+		sendspin: *sendspinAddr, bluetooth: *btProxy}
 	if *prefix != "" {
 		cfg.prefix = *prefix
 	}

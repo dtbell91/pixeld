@@ -73,6 +73,7 @@ type Satellite struct {
 	detector *Detector
 	speaker  *Speaker
 	timed    TimedSource // synchronised music (Sendspin), set before Run
+	bt       atomic.Pointer[bluetooth]
 
 	mu           sync.Mutex
 	conn         *api.Conn
@@ -438,6 +439,9 @@ func (s *Satellite) Connected(c *api.Conn) {
 }
 
 func (s *Satellite) Disconnected(c *api.Conn) {
+	if bt := s.bt.Load(); bt != nil {
+		bt.Disconnected(c)
+	}
 	s.mu.Lock()
 	if s.conn == c {
 		s.conn, s.streaming, s.pipeline = nil, false, false
@@ -482,15 +486,45 @@ func (s *Satellite) setAnnouncing(d int) {
 	s.sendMediaState()
 }
 
+// BluetoothProxy is what the light offers Home Assistant as a Bluetooth proxy (pixeld/bt).
+type BluetoothProxy interface {
+	Flags() uint32
+	MAC() string
+	Message(c *api.Conn, m proto.Message) bool // handles the proxy's messages
+	Disconnected(c *api.Conn)
+}
+
+type bluetooth struct{ BluetoothProxy }
+
+// SetBluetooth adds the Bluetooth proxy once it's up. Home Assistant learns of it from the device info,
+// so a connection made before is closed for it to reconnect and see it.
+func (s *Satellite) SetBluetooth(b BluetoothProxy) {
+	s.bt.Store(&bluetooth{b})
+	s.mu.Lock()
+	c := s.conn
+	s.mu.Unlock()
+	if c != nil {
+		c.Close()
+	}
+}
+
 func (s *Satellite) Message(c *api.Conn, m proto.Message) {
+	bt := s.bt.Load()
+	if bt != nil && bt.Message(c, m) {
+		return
+	}
 	switch req := m.(type) {
 	case *api.DeviceInfoRequest:
-		c.Send(&api.DeviceInfoResponse{
+		info := &api.DeviceInfoResponse{
 			Name: s.Name, FriendlyName: s.FriendlyName, MacAddress: s.MAC, EsphomeVersion: "2025.9.0",
 			Model: "H8630 Gaming Pixel Light", Manufacturer: "Govee (custom firmware)",
 			ProjectName: "pixeld.voice", ProjectVersion: s.Version,
 			VoiceAssistantFeatureFlags: featVoiceAssistant | featAPIAudio | featTimers | featAnnounce | featStartConversation,
-		})
+		}
+		if bt != nil {
+			info.BluetoothProxyFeatureFlags, info.BluetoothMacAddress = bt.Flags(), bt.MAC()
+		}
+		c.Send(info)
 	case *api.ListEntitiesRequest:
 		formats := []*api.MediaPlayerSupportedFormat{
 			{Format: "wav", SampleRate: MusicRate, NumChannels: 1, SampleBytes: 2, Purpose: api.MediaPlayerFormatPurpose_MEDIA_PLAYER_FORMAT_PURPOSE_DEFAULT},
