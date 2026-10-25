@@ -12,8 +12,8 @@ Assistant integration (its `pixeld` connection type).
 - **Panel:** a bit-exact framebuffer encoder for the panel (`panel`), a playlist/compositor that rotates
   content on the light and resumes after interruptions (`player`), and cards drawn on the light, e.g. a
   clock (`cards`).
-- **Home Assistant over MQTT** (`px/*` topics): state, playlist, show, content delivered by SHA-256 and
-  cached on the light, telemetry, buttons, headphone jack.
+- **Home Assistant over MQTT** (`px/*` topics): state, playlist, show, content (PNG, full-colour APNG,
+  JPEG or GIF) delivered by SHA-256 and cached on the light, telemetry, buttons, headphone jack.
 - **Voice satellite** over the ESPHome native API (`:6053`), added by Home Assistant's ESPHome
   integration: on-device wake word (microWakeWord via an external `mww` binary), announcements, and timers
   shown on the panel. The speaker is a media player too (e.g. for Music Assistant): music streams as

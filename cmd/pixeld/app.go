@@ -587,7 +587,7 @@ func run(ctx context.Context, cfg config) error {
 
 // deviceInfo identifies the light for Home Assistant (published retained on px/info).
 func deviceInfo(sim bool) map[string]any {
-	info := map[string]any{"sku": "H8630", "size": panel.Size, "pixeld": version}
+	info := map[string]any{"sku": "H8630", "size": panel.Size, "pixeld": version, "formats": content.Formats}
 	if mac, err := os.ReadFile("/sys/class/net/wlan0/address"); err == nil {
 		info["mac"] = strings.TrimSpace(string(mac))
 	} else if sim {

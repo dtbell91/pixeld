@@ -1,3 +1,4 @@
 /pixeld
 /dist/
 *.png
+!/content/testdata/*.png
