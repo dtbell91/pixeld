@@ -1,4 +1,4 @@
-// Package content turns image files (PNG, JPEG, GIF) into 32x32 frames with display durations.
+// Package content turns image files (PNG, APNG, JPEG, GIF) into 32x32 frames with display durations.
 package content
 
 import (
@@ -28,10 +28,16 @@ const (
 	defaultGIFStep = 100 * time.Millisecond
 )
 
-// Decode reads PNG, JPEG or GIF bytes. Still images give one frame with Duration 0 (shown until replaced).
+// Formats lists what Decode reads, for Home Assistant to pick from (APNG: full-colour animation).
+var Formats = []string{"png", "apng", "jpeg", "gif"}
+
+// Decode reads PNG, APNG, JPEG or GIF bytes. Still images give one frame with Duration 0 (shown until replaced).
 func Decode(data []byte) ([]Frame, error) {
 	if bytes.HasPrefix(data, []byte("GIF8")) {
 		return decodeGIF(data)
+	}
+	if isAPNG(data) {
+		return decodeAPNG(data)
 	}
 	img, _, err := image.Decode(bytes.NewReader(data))
 	if err != nil {
