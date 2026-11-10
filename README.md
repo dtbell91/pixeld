@@ -49,7 +49,8 @@ window onto the sky:
   ground has puddles.
 - Under the sky, in turn: the temperature (with a bar along the bottom showing it between today's `low` and
   `high`), high/low, feels like (`apparent`, when it differs by 3°), chance and amount of rain, wind speed and
-  direction, UV index and its level, and the next sunrise or sunset.
+  direction, UV index and its level, the fire danger rating (`fire`, Australian ratings, as a four-step gauge in
+  `fire_color`), weather warnings in force (`warnings`), and the next sunrise or sunset.
 
 The forecast card shows up to three `days` (condition, high, low, rain chance as a bar, day name), with the
 icons animating live and today's icon turning to night after sunset.

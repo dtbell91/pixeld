@@ -31,6 +31,9 @@ type WeatherSpec struct {
 	Bearing   *float64 `json:"bearing"`   // where the wind comes from, degrees
 	UV        *float64 `json:"uv"`
 	Cloud     *float64 `json:"cloud"` // cloud coverage %
+	Fire      string   `json:"fire"`       // fire danger rating, e.g. "Moderate" (Australian ratings)
+	FireColor *RGB     `json:"fire_color"` // the rating's official colour
+	Warnings  int      `json:"warnings"`   // weather warnings in force
 }
 
 // The condition's icon family (animations.HA_CONDITIONS).
@@ -715,6 +718,18 @@ func (w *Weather) makePages() []page {
 			}
 		}})
 	}
+	if s.Warnings > 0 {
+		ps = append(ps, page{3, func(c *canvas, now time.Time) {
+			pulse := 0.5 + 0.5*math.Sin(float64(now.UnixMilli()%100000)/1000*5)
+			k := lerpc(col{255, 120, 20}, col{255, 220, 70}, pulse)
+			word := "WARNING"
+			if s.Warnings > 1 {
+				word = fmt.Sprintf("%d WARN.", s.Warnings)
+			}
+			c.line(0, word, 0, col{}, k)
+			c.line(0, "IN FORCE", 6, col{}, scalec(k, 0.7))
+		}})
+	}
 	if s.High != nil || s.Low != nil {
 		ps = append(ps, page{3, func(c *canvas, now time.Time) {
 			if s.High != nil {
@@ -793,6 +808,9 @@ func (w *Weather) makePages() []page {
 			c.line(0, word, 6, col{}, scalec(k, 0.7))
 		}})
 	}
+	if level, word := fireLevel(s.Fire); level > 0 {
+		ps = append(ps, page{3, func(c *canvas, now time.Time) { drawFire(c, now, level, word, s.FireColor) }})
+	}
 	ps = append(ps, page{3, func(c *canvas, now time.Time) {
 		at, rise, ok := sunEvent(now, w.lat, w.lon)
 		if !ok {
@@ -864,4 +882,55 @@ func (w *Weather) blitPage(c *canvas, i int, now time.Time, dy int) {
 			}
 		}
 	}
+}
+
+// Australian Fire Danger Rating System levels (1 moderate .. 4 catastrophic) and the colours of its gauge.
+var fireCols = [5]col{{}, {100, 191, 48}, {255, 220, 0}, {247, 140, 30}, {215, 30, 45}}
+
+// fireLevel reads a rating (current names, and the older ones some sources still give).
+func fireLevel(r string) (int, string) {
+	switch strings.ToUpper(strings.TrimSpace(r)) {
+	case "MODERATE", "LOW-MODERATE", "LOW MODERATE", "LOW", "LOW TO MODERATE":
+		return 1, "MODERATE"
+	case "HIGH", "VERY HIGH":
+		return 2, strings.ToUpper(strings.TrimSpace(r))
+	case "EXTREME", "SEVERE":
+		return 3, strings.ToUpper(strings.TrimSpace(r))
+	case "CATASTROPHIC", "CODE RED":
+		return 4, "CATASTROPHIC"
+	}
+	return 0, ""
+}
+
+// drawFire is the fire danger page: "FIRE" and a four-step gauge lit up to the level, then the rating.
+func drawFire(c *canvas, now time.Time, level int, word string, official *RGB) {
+	c.text("FIRE", 0, 0, col{200, 200, 210}, 1)
+	for i := 1; i <= 4; i++ {
+		k := scalec(fireCols[i], 0.3)
+		if i == level {
+			k = fireCols[i]
+		}
+		x := 17 + (i-1)*4
+		for dy := 0; dy < 5; dy++ { // steps rising like the gauge's arc
+			if dy >= 3-min(i, 3) || i == level {
+				c.blend(x, dy, k, 1)
+				c.blend(x+1, dy, k, 1)
+				c.blend(x+2, dy, k, 1)
+			}
+		}
+	}
+	k := fireCols[level]
+	if official != nil {
+		k = rgbc(*official)
+		if m := math.Max(k[0], math.Max(k[1], k[2])); m < 170 && m > 0 { // too dark to read on black
+			k = scalec(k, 170/m)
+		}
+	}
+	if word == "CATASTROPHIC" { // too wide for the panel: in two halves, flashing
+		word = "CATAS-"
+		if now.UnixMilli()/700%2 == 1 {
+			word = "TROPHIC"
+		}
+	}
+	c.line(0, word, 6, col{}, k)
 }
