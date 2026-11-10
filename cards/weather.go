@@ -376,6 +376,9 @@ func (w *Weather) drawSky(c *canvas, now time.Time, t float64) {
 			st.rayShort *= 1 - 0.4*low
 		}
 		alpha := 1 - 0.55*overcast
+		if precipCond(w.cond) {
+			alpha *= 0.4 // only a glow through the rain clouds
+		}
 		if w.cond == "fog" {
 			alpha *= 0.5
 		}
