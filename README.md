@@ -10,8 +10,8 @@ Assistant integration (its `pixeld` connection type).
 ## What it does
 
 - **Panel:** a bit-exact framebuffer encoder for the panel (`panel`), a playlist/compositor that rotates
-  content on the light and resumes after interruptions (`player`), and cards drawn on the light, e.g. a
-  clock (`cards`).
+  content on the light and resumes after interruptions (`player`), and cards drawn on the light (`cards`):
+  a clock, and live weather and forecast scenes drawn from the weather data Home Assistant sends (see below).
 - **Home Assistant over MQTT** (`px/*` topics): state, playlist, show, content (PNG, full-colour APNG,
   JPEG or GIF) delivered by SHA-256 and cached on the light, telemetry, buttons, headphone jack.
 - **Voice satellite** over the ESPHome native API (`:6053`), added by Home Assistant's ESPHome
@@ -31,6 +31,32 @@ Assistant integration (its `pixeld` connection type).
   `-bluetooth=false` turns it off.
 - **DDP** live pixels on UDP 4048 (LedFx, xLights, WLED-style senders), and a Pac-Man game with a phone
   controller page on `:8080`.
+
+## Weather cards
+
+`{"type": "weather", ...}` and `{"type": "forecast", ...}` playlist cards are drawn by the light at 20 fps from
+the data in the card, so Home Assistant only sends new numbers when the weather changes. The weather card is a
+window onto the sky:
+
+- The sun and moon cross the sky where they really are, from the light's clock and the card's `lat`/`lon`
+  (facing the equator: rising on the left in the northern hemisphere, the right in the southern), the moon at
+  its actual phase. The sky goes through dawn, day, sunset and night colours, with twinkling stars and the
+  odd shooting star on clear nights.
+- `cloud` (%) sets how many clouds there are; they drift with `wind` / `bearing`, and are lit pink at sunrise
+  and sunset. Rain, snow, sleet and hail fall harder with `rate` (expected in the next hour) and slant with the
+  wind; storms flash with lightning at random. Streaks of wind from 22 km/h; leaves (petals in spring) in a
+  gale. `uv` grows the sun's halo and rays. Hot days shimmer near the ground, frosty ground glints, wet
+  ground has puddles.
+- Under the sky, in turn: the temperature (with a bar along the bottom showing it between today's `low` and
+  `high`), high/low, feels like (`apparent`, when it differs by 3°), chance and amount of rain, wind speed and
+  direction, UV index and its level, the fire danger rating (`fire`, Australian ratings, as a four-step gauge in
+  `fire_color`), weather warnings in force (`warnings`), and the next sunrise or sunset.
+
+The forecast card shows up to three `days` (condition, high, low, rain chance as a bar, day name), with the
+icons animating live and today's icon turning to night after sunset.
+
+`go run ./cmd/cardpreview -frames 6 -step 1s '{"type":"weather",...}'` draws a card over time to a PNG (or
+`-gif out.gif` as an animation).
 
 ## Build
 
