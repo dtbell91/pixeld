@@ -28,6 +28,9 @@ type Card struct {
 	ShowsBadges bool
 }
 
+// Types are the card types this build draws (announced to Home Assistant in px/info).
+var Types = []string{"clock", "weather", "forecast"}
+
 // New builds a card from its JSON spec: {"type": "clock", ...}.
 func New(spec json.RawMessage, env Env) (*Card, error) {
 	var head struct {
@@ -48,6 +51,26 @@ func New(spec json.RawMessage, env Env) (*Card, error) {
 		}
 		c.SetBadge(env.Badge)
 		return &Card{Render: c.Render, ShowsBadges: c.badge != nil}, nil
+	case "weather":
+		var s WeatherSpec
+		if err := json.Unmarshal(spec, &s); err != nil {
+			return nil, err
+		}
+		w, err := NewWeather(s)
+		if err != nil {
+			return nil, err
+		}
+		return &Card{Render: w.Render}, nil
+	case "forecast":
+		var s ForecastSpec
+		if err := json.Unmarshal(spec, &s); err != nil {
+			return nil, err
+		}
+		f, err := NewForecast(s)
+		if err != nil {
+			return nil, err
+		}
+		return &Card{Render: f.Render}, nil
 	}
 	return nil, fmt.Errorf("unknown card type %q", head.Type)
 }
