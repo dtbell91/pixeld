@@ -12,7 +12,7 @@ Assistant integration (its `pixeld` connection type).
 - **Panel:** a bit-exact framebuffer encoder for the panel (`panel`), a playlist/compositor that rotates
   content on the light and resumes after interruptions (`player`), and cards drawn on the light (`cards`):
   a clock, and live weather and forecast scenes drawn from the weather data Home Assistant sends (see below).
-- **Home Assistant over MQTT** (`px/*` topics): state, playlist, show, content (PNG, full-colour APNG,
+- **Home Assistant over MQTT** (`px/*` topics): state, playlist (next / previous / go to an item / hold it), show, content (PNG, full-colour APNG,
   JPEG or GIF) delivered by SHA-256 and cached on the light, telemetry, buttons, headphone jack.
 - **Voice satellite** over the ESPHome native API (`:6053`), added by Home Assistant's ESPHome
   integration: on-device wake word (microWakeWord via an external `mww` binary), announcements, and timers
@@ -52,8 +52,17 @@ window onto the sky:
   direction, UV index and its level, the fire danger rating (`fire`, Australian ratings, as a four-step gauge in
   `fire_color`), weather warnings in force (`warnings`), and the next sunrise or sunset.
 
+How the strip is shown: `pages` (which, in what order: `temperature`, `warnings`, `high_low`, `feels_like`, `rain`,
+`wind`, `uv`, `fire`, `sun`; default all), `temp_seconds` (6), `page_seconds` (4), `transition` (0.35 s slide). Each
+time the card comes back on screen it shows the first page and then carries on where it left off, so a short
+playlist turn still gets through every page over a few turns (`restart_pages: true` always starts again).
+
+A `clock` card with a `weather` spec draws the same live scene behind the time: sky and ground on top, the time
+under them, the date over the horizon.
+
 The forecast card shows up to three `days` (condition, high, low, rain chance as a bar, day name), with the
-icons animating live and today's icon turning to night after sunset.
+icons animating live and today's icon turning to night after sunset. `page_seconds` (4) sets how long the highs and lows, then the days
+and rain chances, show.
 
 `go run ./cmd/cardpreview -frames 6 -step 1s '{"type":"weather",...}'` draws a card over time to a PNG (or
 `-gif out.gif` as an animation).

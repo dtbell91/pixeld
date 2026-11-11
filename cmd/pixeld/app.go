@@ -39,6 +39,7 @@ var reKey = regexp.MustCompile(`^[0-9a-f]{64}$`)
 type savedState struct {
 	On         bool `json:"on"`
 	Brightness int  `json:"brightness"`
+	Held       bool `json:"held,omitempty"`
 }
 
 type playlistMsg struct {
@@ -57,10 +58,20 @@ type showMsg struct {
 }
 
 type setMsg struct {
-	On         *bool `json:"on"`
-	Brightness *int  `json:"brightness"`
-	Resume     bool  `json:"resume"`
-	Next       bool  `json:"next"`
+	On         *bool  `json:"on"`
+	Brightness *int   `json:"brightness"`
+	Resume     bool   `json:"resume"`
+	Next       bool   `json:"next"`
+	Prev       bool   `json:"prev"`
+	Goto       string `json:"goto"` // show this playlist item now
+	Hold       *bool  `json:"hold"` // stay on the item showing / carry on rotating
+}
+
+// liveCard is a card drawn for a playlist item, kept while its spec doesn't change so it carries on where it
+// was (e.g. the weather card's info pages) when the playlist is re-sent.
+type liveCard struct {
+	spec string
+	card *cards.Card
 }
 
 type app struct {
@@ -71,7 +82,8 @@ type app struct {
 	mu        sync.Mutex
 	frames    map[string][]content.Frame // decoded content by key
 	playlist  playlistMsg
-	pending   *showMsg // show waiting for its content
+	cards     map[string]liveCard // by item name
+	pending   *showMsg            // show waiting for its content
 	missing   map[string]bool
 	lastState []byte
 	voice     *voice.Satellite
@@ -127,14 +139,19 @@ func (a *app) load(key string) []content.Frame {
 func (a *app) applyPlaylist() {
 	items := make([]*player.Item, 0, len(a.playlist.Items))
 	keep := map[string]bool{}
+	live := map[string]liveCard{}
 	for _, it := range a.playlist.Items {
 		dur := time.Duration(it.Duration * float64(time.Second))
 		if len(it.Card) > 0 {
-			card, err := cards.New(it.Card, a.cardEnv())
-			if err != nil {
-				log.Printf("playlist item %q: %v", it.Name, err)
-				continue
+			card := a.cards[it.Name].card
+			if a.cards[it.Name].spec != string(it.Card) {
+				var err error
+				if card, err = cards.New(it.Card, a.cardEnv()); err != nil {
+					log.Printf("playlist item %q: %v", it.Name, err)
+					continue
+				}
 			}
+			live[it.Name] = liveCard{string(it.Card), card}
 			items = append(items, &player.Item{Name: it.Name, Key: "card:" + it.Name, Duration: dur,
 				Render: card.Render, ShowsBadges: card.ShowsBadges})
 			continue
@@ -154,6 +171,7 @@ func (a *app) applyPlaylist() {
 		items = append(items, &player.Item{Name: "timers", Key: "voice:timers", Duration: timerSlot,
 			Render: a.voice.RenderTimers, ShowsBadges: true})
 	}
+	a.cards = live
 	// forget decoded content no longer referenced (the files stay cached on disk)
 	for k := range a.frames {
 		if !keep[k] && (a.pending == nil || a.pending.Key != k) {
@@ -301,6 +319,15 @@ func (a *app) onSet(_ mqtt.Client, m mqtt.Message) {
 	if s.Next {
 		a.player.Next()
 	}
+	if s.Prev {
+		a.player.Prev()
+	}
+	if s.Goto != "" && !a.player.Goto(s.Goto) {
+		log.Printf("goto %q: no such playlist item", s.Goto)
+	}
+	if s.Hold != nil {
+		a.player.Hold(*s.Hold)
+	}
 }
 
 // idleLED: green = display on, red = off, amber = microphone muted (voice satellite).
@@ -437,7 +464,7 @@ func (a *app) onStatus(st player.Status) {
 	if a.client != nil && a.client.IsConnected() {
 		a.client.Publish(a.topic("px/state"), 1, true, b)
 	}
-	sb, _ := json.Marshal(savedState{On: st.On, Brightness: st.Brightness})
+	sb, _ := json.Marshal(savedState{On: st.On, Brightness: st.Brightness, Held: st.Held})
 	writeFileAtomic(a.path("state.json"), sb)
 }
 
@@ -476,6 +503,9 @@ func run(ctx context.Context, cfg config) error {
 		json.Unmarshal(b, &st)
 	}
 	a.player = player.New(sink, st.On, st.Brightness, a.onStatus)
+	if st.Held {
+		a.player.Hold(true)
+	}
 	if b, err := os.ReadFile(a.path("playlist.json")); err == nil && json.Unmarshal(b, &a.playlist) == nil {
 		a.mu.Lock()
 		a.applyPlaylist() // show the last playlist straight away, even before MQTT connects
@@ -583,7 +613,6 @@ func run(ctx context.Context, cfg config) error {
 		}
 	}
 }
-
 
 // deviceInfo identifies the light for Home Assistant (published retained on px/info).
 func deviceInfo(sim bool) map[string]any {

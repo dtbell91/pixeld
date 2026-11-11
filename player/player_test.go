@@ -153,3 +153,47 @@ func TestOverlay(t *testing.T) {
 		t.Fatal("overlay drawn over an item that shows badges itself")
 	}
 }
+
+func TestPrevGotoHold(t *testing.T) {
+	p, _, now := setup()
+	p.SetPlaylist([]*Item{still("a", 1, 10*time.Second), still("b", 2, 10*time.Second), still("c", 3, 10*time.Second)})
+	p.step()
+	p.Prev()
+	p.step()
+	if st := p.Status(); st.Item != "c" || st.Index != 2 || st.ItemEnds != now.Add(10*time.Second).UnixMilli() {
+		t.Fatalf("prev from a: %+v", st)
+	}
+	if p.Goto("nope") {
+		t.Fatal("goto an unknown item")
+	}
+	*now = now.Add(4 * time.Second)
+	if !p.Goto("b") {
+		t.Fatal("goto b")
+	}
+	p.step()
+	if st := p.Status(); st.Item != "b" || st.ItemEnds != now.Add(10*time.Second).UnixMilli() {
+		t.Fatalf("goto b: %+v", st)
+	}
+	p.Hold(true)
+	*now = now.Add(time.Minute)
+	if next, _ := p.step(); p.Status().Item != "b" || !p.Status().Held || p.Status().ItemEnds != 0 || !next.IsZero() {
+		t.Fatalf("held: %+v next %v", p.Status(), next)
+	}
+	p.Next() // moving while held: stays on the new item
+	*now = now.Add(time.Minute)
+	p.step()
+	if p.Status().Item != "c" {
+		t.Fatalf("next while held: %+v", p.Status())
+	}
+	p.Hold(false) // the item gets its full time from now
+	*now = now.Add(9 * time.Second)
+	p.step()
+	if p.Status().Item != "c" {
+		t.Fatalf("released: %+v", p.Status())
+	}
+	*now = now.Add(2 * time.Second)
+	p.step()
+	if p.Status().Item != "a" {
+		t.Fatalf("after release: %+v", p.Status())
+	}
+}

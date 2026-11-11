@@ -56,6 +56,11 @@ type Status struct {
 	Item       string `json:"item,omitempty"`
 	Items      int    `json:"playlist_items"`
 	Paused     bool   `json:"paused"` // playlist held by an interruption without a time limit
+	Index      int    `json:"index"`  // the playlist item on screen (or under an interruption)
+	// Held: the rotation stays on the current item (Hold); next / previous / go to still move it.
+	Held bool `json:"held"`
+	// ItemEnds: when the rotation moves on from the current item, Unix ms (0: it doesn't, e.g. held).
+	ItemEnds int64 `json:"item_ends,omitempty"`
 }
 
 type Player struct {
@@ -66,9 +71,10 @@ type Player struct {
 	items      []*Item
 	idx        int
 	itemStart  time.Time
+	held       bool
 	intr       *Item
 	intrStart  time.Time
-	intrUntil  time.Time // zero: until Resume
+	intrUntil  time.Time    // zero: until Resume
 	live       *panel.Frame // latest streamed frame (DDP), shown over everything until liveUntil
 	liveUntil  time.Time
 	overlay    Overlay
@@ -189,12 +195,45 @@ func (p *Player) SetOverlay(o Overlay) {
 func (p *Player) Refresh() { p.poke() }
 
 // Next skips to the next playlist item (or resumes the playlist if interrupted).
-func (p *Player) Next() {
+func (p *Player) Next() { p.skip(1) }
+
+// Prev goes back to the previous playlist item (or resumes the playlist if interrupted).
+func (p *Player) Prev() { p.skip(-1) }
+
+func (p *Player) skip(by int) {
 	p.mu.Lock()
 	if p.intr != nil {
 		p.intr = nil
-	} else if len(p.items) > 0 {
-		p.idx = (p.idx + 1) % len(p.items)
+	} else if n := len(p.items); n > 0 {
+		p.idx = ((p.idx+by)%n + n) % n
+		p.itemStart = p.now()
+	}
+	p.mu.Unlock()
+	p.poke()
+}
+
+// Goto shows the playlist item with this name now, for its full duration (ending an interruption). It
+// reports whether there is one.
+func (p *Player) Goto(name string) bool {
+	p.mu.Lock()
+	found := false
+	for i, it := range p.items {
+		if it.Name == name {
+			p.idx, p.itemStart, p.intr, found = i, p.now(), nil, true
+			break
+		}
+	}
+	p.mu.Unlock()
+	p.poke()
+	return found
+}
+
+// Hold keeps the rotation on the item showing (true) or lets it carry on (false), giving the item its full
+// duration again from now.
+func (p *Player) Hold(on bool) {
+	p.mu.Lock()
+	if p.held != on {
+		p.held = on
 		p.itemStart = p.now()
 	}
 	p.mu.Unlock()
@@ -208,7 +247,13 @@ func (p *Player) Status() Status {
 }
 
 func (p *Player) status() Status {
-	s := Status{On: p.on, Brightness: p.brightness, Items: len(p.items)}
+	s := Status{On: p.on, Brightness: p.brightness, Items: len(p.items), Held: p.held}
+	if len(p.items) > 0 {
+		s.Index = p.idx
+		if !p.held && len(p.items) > 1 {
+			s.ItemEnds = p.itemStart.Add(duration(p.items[p.idx])).UnixMilli()
+		}
+	}
 	switch {
 	case !p.on:
 		s.Showing = ShowingOff
@@ -252,6 +297,13 @@ func frameAt(it *Item, start, now time.Time) (*panel.Frame, time.Time) {
 	return &it.Frames[0].Pixels, now.Add(it.Frames[0].Duration)
 }
 
+func duration(it *Item) time.Duration {
+	if it.Duration <= 0 {
+		return DefaultItemDuration
+	}
+	return it.Duration
+}
+
 func earliest(a, b time.Time) time.Time {
 	if a.IsZero() || (!b.IsZero() && b.Before(a)) {
 		return b
@@ -267,21 +319,15 @@ func (p *Player) step() (time.Time, error) {
 	if p.intr != nil && !p.intrUntil.IsZero() && !now.Before(p.intrUntil) {
 		p.intr = nil
 	}
-	if len(p.items) > 1 {
-		d := p.items[p.idx].Duration
-		if d <= 0 {
-			d = DefaultItemDuration
-		}
+	if len(p.items) > 1 && !p.held {
+		d := duration(p.items[p.idx])
 		for !now.Before(p.itemStart.Add(d)) {
 			p.itemStart = p.itemStart.Add(d)
 			if now.Sub(p.itemStart) > d { // long gap (e.g. was off): don't replay every missed switch
 				p.itemStart = now
 			}
 			p.idx = (p.idx + 1) % len(p.items)
-			d = p.items[p.idx].Duration
-			if d <= 0 {
-				d = DefaultItemDuration
-			}
+			d = duration(p.items[p.idx])
 		}
 		next = p.itemStart.Add(d)
 	}

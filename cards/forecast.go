@@ -15,6 +15,8 @@ type ForecastSpec struct {
 	Lon  *float64      `json:"lon"`
 	Unit string        `json:"unit"`
 	Days []ForecastDay `json:"days"`
+	// PageSeconds: how long the highs and lows, then the days and rain chances, show (default 4 each).
+	PageSeconds *float64 `json:"page_seconds"`
 }
 
 type ForecastDay struct {
@@ -28,6 +30,7 @@ type ForecastDay struct {
 
 type Forecast struct {
 	spec        ForecastSpec
+	page        float64 // seconds for the highs and lows, and for the days and rain chance
 	start, last time.Time
 	cv          canvas
 }
@@ -39,14 +42,11 @@ func NewForecast(spec ForecastSpec) (*Forecast, error) {
 	if len(spec.Days) > 3 {
 		spec.Days = spec.Days[:3]
 	}
-	return &Forecast{spec: spec}, nil
+	page := seconds(spec.PageSeconds, defaultPageSeconds, 1, 120)
+	return &Forecast{spec: spec, page: page}, nil
 }
 
-const (
-	fcHigh = 3 // seconds: highs and lows, then days and rain chance
-	fcDays = 3
-	fcFade = 0.4
-)
+const fcFade = 0.4
 
 func (f *Forecast) Render(now time.Time) (*panel.Frame, time.Time) {
 	if f.start.IsZero() || now.Sub(f.last) > 2*time.Second || now.Before(f.last) {
@@ -81,7 +81,8 @@ func (f *Forecast) Render(now time.Time) (*panel.Frame, time.Time) {
 		}
 	}
 	// the text alternates: highs and lows, then the days and the chance of rain
-	el := math.Mod(now.Sub(f.start).Seconds(), fcHigh+fcDays)
+	fcHigh := f.page
+	el := math.Mod(now.Sub(f.start).Seconds(), 2*f.page)
 	a := 1.0 // how much of the highs/lows show
 	switch {
 	case el < fcFade && now.Sub(f.start).Seconds() > fcFade:

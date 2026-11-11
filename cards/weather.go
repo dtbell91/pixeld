@@ -30,10 +30,38 @@ type WeatherSpec struct {
 	WindUnit  string   `json:"wind_unit"` // "km/h" (default), "m/s", "mph", "kn", "ft/s"
 	Bearing   *float64 `json:"bearing"`   // where the wind comes from, degrees
 	UV        *float64 `json:"uv"`
-	Cloud     *float64 `json:"cloud"` // cloud coverage %
+	Cloud     *float64 `json:"cloud"`      // cloud coverage %
 	Fire      string   `json:"fire"`       // fire danger rating, e.g. "Moderate" (Australian ratings)
 	FireColor *RGB     `json:"fire_color"` // the rating's official colour
 	Warnings  int      `json:"warnings"`   // weather warnings in force
+
+	// How the info strip under the sky is shown. Pages are named (see pageOrder); left out: all of them, in that
+	// order (each only when there is data for it).
+	Pages       []string `json:"pages"`
+	PageSeconds *float64 `json:"page_seconds"` // how long each info page shows (default 4)
+	TempSeconds *float64 `json:"temp_seconds"` // the temperature page (default 6)
+	Transition  *float64 `json:"transition"`   // seconds for one page to slide out and the next in (default 0.35)
+	// RestartPages: start from the first page every time the card comes on screen. Otherwise the card shows
+	// the first page and then carries on from where it left off, so a short playlist turn still gets through
+	// every page over a few turns.
+	RestartPages bool `json:"restart_pages"`
+}
+
+// pageOrder is the info pages' names, in their default order.
+var pageOrder = []string{"temperature", "warnings", "high_low", "feels_like", "rain", "wind", "uv", "fire", "sun"}
+
+const (
+	defaultPageSeconds = 4.0
+	defaultTempSeconds = 6.0
+	defaultTransition  = 0.35
+)
+
+// seconds reads an optional duration, clamped to [lo, hi].
+func seconds(v *float64, def, lo, hi float64) float64 {
+	if v == nil {
+		return def
+	}
+	return math.Max(lo, math.Min(hi, *v))
 }
 
 // The condition's icon family (animations.HA_CONDITIONS).
@@ -76,8 +104,15 @@ type Weather struct {
 	rate    float64 // precipitation now, mm/h
 	clouds  []cloud
 	pages   []page
+	slide   float64 // seconds for a page to slide out and the next in
 
-	start, last time.Time // when the card came on screen (for the info pages); last frame drawn
+	// The info strip: the page showing, since when, and (coming back on screen) the page to carry on with
+	// after the first one (-1: just the next).
+	page   int
+	pageAt time.Time
+	after  int
+
+	start, last time.Time // when the card came on screen; last frame drawn
 	cv          canvas
 }
 
@@ -88,6 +123,7 @@ type cloud struct {
 }
 
 type page struct {
+	id    string
 	dwell float64 // seconds
 	draw  func(c *canvas, now time.Time)
 }
@@ -143,6 +179,8 @@ func NewWeather(spec WeatherSpec) (*Weather, error) {
 	}
 	w.clouds = w.makeClouds()
 	w.pages = w.makePages()
+	w.slide = seconds(spec.Transition, defaultTransition, 0, 2)
+	w.after = -1
 	return w, nil
 }
 
@@ -229,7 +267,8 @@ func (w *Weather) makeClouds() []cloud {
 // Render draws the weather for now; the scene moves continuously, so it returns the next frame's time.
 func (w *Weather) Render(now time.Time) (*panel.Frame, time.Time) {
 	if w.start.IsZero() || now.Sub(w.last) > 2*time.Second || now.Before(w.last) {
-		w.start = now // back on screen: start again from the first page
+		w.start = now // (back) on screen
+		w.enter(now)
 	}
 	w.last = now
 	c := &w.cv
@@ -701,9 +740,17 @@ func uvLevel(uv float64) (string, col) {
 
 func (w *Weather) makePages() []page {
 	s := w.spec
-	var ps []page
+	pageSecs := seconds(s.PageSeconds, defaultPageSeconds, 1, 120)
+	byID := map[string]page{}
+	add := func(id string, draw func(c *canvas, now time.Time)) {
+		d := pageSecs
+		if id == "temperature" {
+			d = seconds(s.TempSeconds, defaultTempSeconds, 1, 120)
+		}
+		byID[id] = page{id, d, draw}
+	}
 	if s.Temp != nil {
-		ps = append(ps, page{5, func(c *canvas, now time.Time) {
+		add("temperature", func(c *canvas, now time.Time) {
 			c.bigTemp(*s.Temp, s.Unit, 1)
 			if s.Low != nil && s.High != nil && *s.High > *s.Low {
 				lo, hi := toC(*s.Low, s.Unit), toC(*s.High, s.Unit)
@@ -716,10 +763,10 @@ func (w *Weather) makePages() []page {
 				c.dot(mx, 11, k, 1, false, false)
 				c.dot(mx+1, 11, k, 1, false, false)
 			}
-		}})
+		})
 	}
 	if s.Warnings > 0 {
-		ps = append(ps, page{3, func(c *canvas, now time.Time) {
+		add("warnings", func(c *canvas, now time.Time) {
 			pulse := 0.5 + 0.5*math.Sin(float64(now.UnixMilli()%100000)/1000*5)
 			k := lerpc(col{255, 120, 20}, col{255, 220, 70}, pulse)
 			word := "WARNING"
@@ -728,10 +775,10 @@ func (w *Weather) makePages() []page {
 			}
 			c.line(0, word, 0, col{}, k)
 			c.line(0, "IN FORCE", 6, col{}, scalec(k, 0.7))
-		}})
+		})
 	}
 	if s.High != nil || s.Low != nil {
-		ps = append(ps, page{3, func(c *canvas, now time.Time) {
+		add("high_low", func(c *canvas, now time.Time) {
 			if s.High != nil {
 				k := tempCol(*s.High, s.Unit)
 				c.line(arrowUp, deg(*s.High)+"°", 0, k, k)
@@ -740,17 +787,17 @@ func (w *Weather) makePages() []page {
 				k := tempCol(*s.Low, s.Unit)
 				c.line(arrowDown, deg(*s.Low)+"°", 6, k, k)
 			}
-		}})
+		})
 	}
 	if s.Apparent != nil && s.Temp != nil && math.Abs(toC(*s.Apparent, s.Unit)-toC(*s.Temp, s.Unit)) >= 3 {
-		ps = append(ps, page{3, func(c *canvas, now time.Time) {
+		add("feels_like", func(c *canvas, now time.Time) {
 			c.line(0, "FEELS", 0, col{}, col{170, 170, 190})
 			c.line(0, deg(*s.Apparent)+"°", 6, col{}, tempCol(*s.Apparent, s.Unit))
-		}})
+		})
 	}
 	raining := precipCond(w.cond)
 	if (s.Chance != nil && *s.Chance >= 10) || (s.Precip != nil && *s.Precip >= 0.1) || raining {
-		ps = append(ps, page{3, func(c *canvas, now time.Time) {
+		add("rain", func(c *canvas, now time.Time) {
 			blue, pale := col{90, 160, 255}, col{170, 200, 255}
 			switch {
 			case s.Chance != nil:
@@ -772,10 +819,10 @@ func (w *Weather) makePages() []page {
 				}
 				c.line(drop, word, 0, blue, blue)
 			}
-		}})
+		})
 	}
 	if s.Wind != nil {
-		ps = append(ps, page{3, func(c *canvas, now time.Time) {
+		add("wind", func(c *canvas, now time.Time) {
 			k := col{170, 220, 255}
 			switch {
 			case w.windKmh >= 50:
@@ -799,19 +846,19 @@ func (w *Weather) makePages() []page {
 				u = "KM/H"
 			}
 			c.line(0, u, 6, col{}, scalec(k, 0.6))
-		}})
+		})
 	}
 	if s.UV != nil && *s.UV >= 1 {
-		ps = append(ps, page{3, func(c *canvas, now time.Time) {
+		add("uv", func(c *canvas, now time.Time) {
 			word, k := uvLevel(*s.UV)
 			c.line(0, "UV "+deg(*s.UV), 0, col{}, k)
 			c.line(0, word, 6, col{}, scalec(k, 0.7))
-		}})
+		})
 	}
 	if level, word := fireLevel(s.Fire); level > 0 {
-		ps = append(ps, page{3, func(c *canvas, now time.Time) { drawFire(c, now, level, word, s.FireColor) }})
+		add("fire", func(c *canvas, now time.Time) { drawFire(c, now, level, word, s.FireColor) })
 	}
-	ps = append(ps, page{3, func(c *canvas, now time.Time) {
+	add("sun", func(c *canvas, now time.Time) {
 		at, rise, ok := sunEvent(now, w.lat, w.lon)
 		if !ok {
 			return
@@ -832,37 +879,82 @@ func (w *Weather) makePages() []page {
 		}
 		c.line(0, label, 0, col{}, k)
 		c.line(0, fmt.Sprintf("%s:%02d", hh, at.Minute()), 6, col{}, scalec(k, 0.7))
-	}})
+	})
+	order := pageOrder
+	if s.Pages != nil {
+		order = s.Pages
+	}
+	var ps []page
+	seen := map[string]bool{}
+	for _, id := range order {
+		id = strings.ToLower(strings.TrimSpace(id))
+		if p, ok := byID[id]; ok && !seen[id] {
+			ps = append(ps, p)
+			seen[id] = true
+		}
+	}
 	return ps
 }
 
-const slide = 0.35 // seconds for one page to slide out and the next in
+// enter starts the info strip as the card comes on screen: from the first page, then (unless RestartPages)
+// carrying on from where it was when the card last left the screen.
+func (w *Weather) enter(now time.Time) {
+	n := len(w.pages)
+	resume := 0
+	if !w.pageAt.IsZero() && !w.spec.RestartPages && n > 1 {
+		resume = w.page
+		if w.page == 0 && w.after >= 0 {
+			resume = w.after // was on the first page, on the way back to this one
+		}
+		if w.last.Sub(w.pageAt).Seconds() >= w.pages[w.page].dwell/2 {
+			resume = w.nextPage() // seen it: carry on with the one after
+		}
+	}
+	w.page, w.after, w.pageAt = 0, -1, now
+	if resume > 1 {
+		w.after = resume
+	}
+}
+
+// nextPage is the page that follows the one showing.
+func (w *Weather) nextPage() int {
+	if w.after >= 0 {
+		return w.after
+	}
+	return (w.page + 1) % len(w.pages)
+}
 
 // drawStrip draws the info pages under the sky, sliding from one to the next.
 func (w *Weather) drawStrip(c *canvas, now time.Time) {
-	if len(w.pages) == 0 {
+	n := len(w.pages)
+	if n == 0 {
 		return
 	}
-	total := 0.0
-	for _, p := range w.pages {
-		total += p.dwell
-	}
-	el := math.Mod(now.Sub(w.start).Seconds(), total)
-	i := 0
-	for el >= w.pages[i].dwell {
-		el -= w.pages[i].dwell
-		i++
+	if w.page >= n {
+		w.page, w.after = 0, -1
 	}
 	off := 0.0
-	if len(w.pages) > 1 {
-		if left := w.pages[i].dwell - el; left < slide {
+	if n > 1 {
+		for {
+			d := w.pages[w.page].dwell
+			if now.Sub(w.pageAt).Seconds() < d {
+				break
+			}
+			w.pageAt = w.pageAt.Add(time.Duration(d * float64(time.Second)))
+			w.page, w.after = w.nextPage(), -1
+			if now.Sub(w.pageAt).Seconds() > w.pages[w.page].dwell { // clock jumped: don't replay every page
+				w.pageAt = now
+			}
+		}
+		slide := math.Min(w.slide, w.pages[w.page].dwell/2)
+		if left := w.pages[w.page].dwell - now.Sub(w.pageAt).Seconds(); slide > 0 && left < slide {
 			off = ease(1 - left/slide)
 		}
 	}
 	shift := int(math.Round(off * float64(stripRows)))
-	w.blitPage(c, i, now, -shift)
+	w.blitPage(c, w.page, now, -shift)
 	if shift > 0 {
-		w.blitPage(c, (i+1)%len(w.pages), now, stripRows-shift)
+		w.blitPage(c, w.nextPage(), now, stripRows-shift)
 	}
 }
 
